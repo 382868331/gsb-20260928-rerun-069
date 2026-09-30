@@ -12,6 +12,7 @@ from .engine import (
     IncrementalProjection,
     compute_from_rows,
     explain_from_rows,
+    feature_keys,
     read_log_rows,
 )
 from .store import connect, dumps, loads
@@ -223,7 +224,63 @@ class FeatureService:
         """丢弃增量缓存并整批重放（运维/校验用）。"""
         self.projection.rebuild()
 
-    # ---- 物化：特征值按版本冻结，不被未来修订穿越 ----------------------
+    # ---- 物化：开放结果随可见修订更新，封存结果历史冻结 ------------------
+
+    def _stored_features(self, sample_id: str, feature_name: str, version: int):
+        return self.conn.execute(
+            "SELECT feature_key, value, sealed FROM sample_features "
+            "WHERE sample_id = ? AND feature_name = ? AND version = ?",
+            (sample_id, feature_name, version),
+        ).fetchall()
+
+    def _explain(self, sample, spec: FeatureSpec, batch: bool) -> dict[str, object]:
+        if batch:
+            return self.explain_batch(sample["entity_id"], spec, sample["as_of"])
+        return self.explain_incremental(sample["entity_id"], spec, sample["as_of"])
+
+    def _persist_values(
+        self,
+        sample_id: str,
+        feature_name: str,
+        version: int,
+        values: dict[str, object],
+        evidence: dict[str, dict[str, list[int]]],
+        keys: list[str],
+        *,
+        sealed: bool,
+    ) -> None:
+        """把指定 key 的值与证据落库；开放写可重复，封存写在 key 未封存时才应调用。"""
+        now = int(time.time() * 1000)
+        self.conn.executemany(
+            "DELETE FROM sample_feature_evidence "
+            "WHERE sample_id = ? AND feature_name = ? AND version = ? AND feature_key = ?",
+            [(sample_id, feature_name, version, key) for key in keys],
+        )
+        self.conn.executemany(
+            "INSERT INTO sample_features "
+            "(sample_id, feature_name, version, feature_key, value, computed_at, sealed, sealed_at) "
+            "VALUES (?,?,?,?,?,?,?,?) "
+            "ON CONFLICT(sample_id, feature_name, version, feature_key) DO UPDATE SET "
+            "value = excluded.value, computed_at = excluded.computed_at, "
+            "sealed = excluded.sealed, sealed_at = excluded.sealed_at",
+            [
+                (sample_id, feature_name, version, key, dumps(values[key]), now,
+                 1 if sealed else 0, now if sealed else None)
+                for key in keys
+            ],
+        )
+        self.conn.executemany(
+            "INSERT INTO sample_feature_evidence "
+            "(sample_id, feature_name, version, feature_key, seq, role) "
+            "VALUES (?,?,?,?,?,?)",
+            [
+                (sample_id, feature_name, version, key, seq, role)
+                for key in keys
+                for role, seqs in evidence[key].items()
+                for seq in seqs
+            ],
+        )
+        self.conn.commit()
 
     def materialize(
         self,
@@ -234,12 +291,14 @@ class FeatureService:
         batch: bool = False,
         recompute: bool = False,
     ) -> dict[str, object]:
-        """为样本物化某特征版本的值并持久化冻结。
+        """为样本物化某特征版本的值。
 
-        * 一旦物化，值即固定：之后到达的迟到事件/撤回/修订不会改变它；
-        * ``batch=True`` 走整批重放路径，默认走增量路径；
-        * 同一 (样本, 特征, 版本) 一经物化即封存，之后永不改写；
-        * ``recompute=True`` 只用于临时核对当前账本，不会覆盖冻结快照。
+        * 物化结果默认是**开放**的：之后到达且对样本 as_of 可见的
+          迟到事件/撤回/修订会在下次物化或读取时反映到开放 key 上；
+        * 已调用 seal() 封存的 key 保持历史原值，永不改写；
+        * batch=True 走整批重放路径，默认走增量路径；
+        * recompute=True 只返回 {"frozen": 已存值, "current": 当前可见值}
+          对照，不落库、不改写任何已存结果。
         """
         sample = self._sample(sample_id)
         spec = self._get_spec(feature_name, version)
@@ -249,84 +308,271 @@ class FeatureService:
                 f"样本实体类型 {sample['entity_type']!r} 与特征实体 {spec.entity!r} 不一致"
             )
 
-        frozen = self.conn.execute(
-            "SELECT feature_key, value FROM sample_features "
-            "WHERE sample_id = ? AND feature_name = ? AND version = ?",
-            (sample_id, feature_name, version),
-        ).fetchall()
-        if frozen:
-            frozen_values = {r["feature_key"]: loads(r["value"]) for r in frozen}
-            if not recompute:
-                return frozen_values
-            if batch:
-                current = self.compute_batch(sample["entity_id"], spec, sample["as_of"])
-            else:
-                current = self.compute_incremental(sample["entity_id"], spec, sample["as_of"])
+        stored = self._stored_features(sample_id, feature_name, version)
+        if stored and recompute:
+            current = self._explain(sample, spec, batch)["values"]
+            frozen_values = {r["feature_key"]: loads(r["value"]) for r in stored}
             return {"frozen": frozen_values, "current": current}
 
-        if batch:
-            explained = self.explain_batch(sample["entity_id"], spec, sample["as_of"])
-        else:
-            explained = self.explain_incremental(sample["entity_id"], spec, sample["as_of"])
+        explained = self._explain(sample, spec, batch)
         values = explained["values"]
         evidence = explained["evidence"]
+        sealed_values = {
+            r["feature_key"]: loads(r["value"]) for r in stored if r["sealed"]
+        }
+        open_keys = [key for key in values if key not in sealed_values]
+        if open_keys:
+            self._persist_values(
+                sample_id, feature_name, version, values, evidence, open_keys, sealed=False
+            )
+        # 返回合并视图：开放 key 取当前可见值，封存 key 保持历史原值。
+        return {**values, **sealed_values}
 
-        now = int(time.time() * 1000)
-        self.conn.executemany(
-            "INSERT INTO sample_features "
-            "(sample_id, feature_name, version, feature_key, value, computed_at) "
-            "VALUES (?,?,?,?,?,?) "
-            "ON CONFLICT(sample_id, feature_name, version, feature_key) "
-            "DO UPDATE SET value = excluded.value, computed_at = excluded.computed_at",
-            [
-                (sample_id, feature_name, version, key, dumps(value), now)
-                for key, value in values.items()
-            ],
-        )
-        self.conn.executemany(
-            "INSERT INTO sample_feature_evidence "
-            "(sample_id, feature_name, version, feature_key, seq, role) "
-            "VALUES (?,?,?,?,?,?)",
-            [
-                (sample_id, feature_name, version, key, seq, role)
-                for key, roles in evidence.items()
-                for role, seqs in roles.items()
-                for seq in seqs
-            ],
-        )
-        self.conn.commit()
-        return values
+    # ---- 封存：先预览受影响范围，再确认封存 -----------------------------
+
+    @staticmethod
+    def _window_of(spec: FeatureSpec, feature_key: str) -> int | None:
+        for window in spec.windows:
+            if feature_key.startswith(f"{spec.name}_w{window}_"):
+                return window
+        return None
+
+    def _records_by_seq(self, seqs: list[int]):
+        if not seqs:
+            return {}
+        rows = self.conn.execute(
+            "SELECT seq, event_id, entity, source, op, event_time, arrival_time, payload "
+            "FROM event_log WHERE seq IN (%s)"
+            % ",".join("?" for _ in seqs),
+            seqs,
+        ).fetchall()
+        return {r["seq"]: r for r in rows}
+
+    def _diff_reasons(
+        self,
+        spec: FeatureSpec,
+        feature_key: str,
+        entity: str,
+        as_of: int,
+        old_evidence: dict[str, list[int]],
+        new_evidence: dict[str, list[int]],
+    ) -> list[dict[str, object]]:
+        """对比封存前证据与当前证据，给出每个变化的来源记录与原因分类。"""
+        old_seqs = set(old_evidence.get("behavior", [])) | set(old_evidence.get("state", []))
+        new_seqs = set(new_evidence.get("behavior", [])) | set(new_evidence.get("state", []))
+        added = sorted(new_seqs - old_seqs)
+        removed = sorted(old_seqs - new_seqs)
+        records = self._records_by_seq(added + removed)
+        removed_by_biz = {
+            (records[seq]["source"], records[seq]["event_id"]): records[seq] for seq in removed
+        }
+        window = self._window_of(spec, feature_key)
+        reasons: list[dict[str, object]] = []
+        matched_removed: set[int] = set()
+
+        def entry(kind: str, rec) -> dict[str, object]:
+            return {
+                "kind": kind,
+                "seq": rec["seq"],
+                "event_id": rec["event_id"],
+                "source": rec["source"],
+                "event_time": rec["event_time"],
+                "arrival_time": rec["arrival_time"],
+            }
+
+        for seq in added:
+            rec = records[seq]
+            prev = removed_by_biz.get((rec["source"], rec["event_id"]))
+            if rec["op"] == RETRACT:
+                reasons.append(entry("retract", rec))
+                continue
+            if prev is None:
+                # 证据 diff 之外：查账本里同一业务事件是否有更早可见版本
+                # （例如修订把记录搬进了本窗口，旧版本从未出现在本 key 证据里）。
+                prev = self.conn.execute(
+                    "SELECT seq, event_id, source, op, event_time, arrival_time "
+                    "FROM event_log WHERE entity = ? AND source = ? AND event_id = ? "
+                    "AND seq < ? AND arrival_time <= ? ORDER BY seq DESC LIMIT 1",
+                    (entity, rec["source"], rec["event_id"], seq, as_of),
+                ).fetchone()
+            else:
+                matched_removed.add(prev["seq"])
+            if prev is not None:
+                reasons.append(entry("revision", rec))
+                crosses = False
+                if window is not None and prev["event_time"] != rec["event_time"]:
+                    lo, hi = as_of - window, as_of
+                    crosses = (lo <= prev["event_time"] < hi) != (lo <= rec["event_time"] < hi)
+                if crosses:
+                    reasons.append(
+                        {**entry("boundary_shift", rec),
+                         "previous_event_time": prev["event_time"]}
+                    )
+            else:
+                reasons.append(entry("late_arrival", rec))
+        for seq in removed:
+            if seq in matched_removed:
+                continue
+            rec = records[seq]
+            successor = self.conn.execute(
+                "SELECT seq, event_id, source, op, event_time, arrival_time FROM event_log "
+                "WHERE entity = ? AND source = ? AND event_id = ? AND seq > ? "
+                "AND arrival_time <= ? ORDER BY seq DESC LIMIT 1",
+                (entity, rec["source"], rec["event_id"], seq, as_of),
+            ).fetchone()
+            if successor is not None and successor["op"] == "UPSERT":
+                reasons.append(entry("revision", successor))
+            else:
+                reasons.append(entry("retract", successor if successor is not None else rec))
+        return reasons
+
+    def preview_seal(
+        self,
+        sample_id: str,
+        feature_name: str,
+        version: int | None = None,
+        *,
+        batch: bool = False,
+    ) -> dict[str, object]:
+        """封存前预览：哪些开放 key 会被当前可见资料改变，以及为什么。
+
+        对比“上次物化落库的值/证据”与“按当前账本重算的值/证据”，
+        逐项列出受影响的特征 key、所属窗口（左闭右开区间）与原因
+        （late_arrival 迟到资料 / retract 撤回 / revision 修订 /
+        boundary_shift 窗口边界变化）。已封存 key 不出现在变化里。
+        本方法只读，不落库。
+        """
+        sample = self._sample(sample_id)
+        spec = self._get_spec(feature_name, version)
+        stored = self._stored_features(sample_id, spec.name, spec.version)
+        if not stored:
+            raise KeyError(
+                f"样本 {sample_id!r} 尚未物化 {spec.name!r} v{spec.version}，无封存前基准"
+            )
+        stored_values = {r["feature_key"]: loads(r["value"]) for r in stored}
+        sealed_keys = sorted(r["feature_key"] for r in stored if r["sealed"])
+        stored_evidence: dict[str, dict[str, list[int]]] = {}
+        for row in self.conn.execute(
+            "SELECT feature_key, seq, role FROM sample_feature_evidence "
+            "WHERE sample_id = ? AND feature_name = ? AND version = ?",
+            (sample_id, spec.name, spec.version),
+        ).fetchall():
+            stored_evidence.setdefault(row["feature_key"], {"behavior": [], "state": []})[
+                row["role"]
+            ].append(row["seq"])
+
+        explained = self._explain(sample, spec, batch)
+        values = explained["values"]
+        evidence = explained["evidence"]
+        as_of = sample["as_of"]
+        changes: list[dict[str, object]] = []
+        unchanged: list[str] = []
+        for key in feature_keys(spec):
+            if key in sealed_keys:
+                continue
+            old_ev = stored_evidence.get(key, {"behavior": [], "state": []})
+            new_ev = evidence[key]
+            if stored_values.get(key) == values[key] and old_ev == new_ev:
+                unchanged.append(key)
+                continue
+            window = self._window_of(spec, key)
+            changes.append({
+                "feature_key": key,
+                "window": window,
+                "window_range": None if window is None else [as_of - window, as_of],
+                "stored_value": stored_values.get(key),
+                "current_value": values[key],
+                "reasons": self._diff_reasons(
+                    spec, key, sample["entity_id"], as_of, old_ev, new_ev
+                ),
+            })
+        return {
+            "sample_id": sample_id,
+            "feature_name": spec.name,
+            "version": spec.version,
+            "as_of": as_of,
+            "changes": changes,
+            "unchanged": unchanged,
+            "sealed": sealed_keys,
+        }
+
+    def seal(
+        self,
+        sample_id: str,
+        feature_name: str,
+        version: int | None = None,
+        *,
+        feature_keys: list[str] | tuple[str, ...] | None = None,
+        batch: bool = False,
+    ) -> dict[str, object]:
+        """把指定范围（默认全部仍开放的 key）按当前可见值封存。
+
+        封存后这些 key 的值与证据历史冻结，重启接续保留封存决定；
+        未封存的 key 继续保持开放，随可见资料修订。返回本次封存的值。
+        """
+        sample = self._sample(sample_id)
+        spec = self._get_spec(feature_name, version)
+        if sample["entity_type"] != spec.entity:
+            raise ValueError(
+                f"样本实体类型 {sample['entity_type']!r} 与特征实体 {spec.entity!r} 不一致"
+            )
+        explained = self._explain(sample, spec, batch)
+        values = explained["values"]
+        evidence = explained["evidence"]
+        if feature_keys is None:
+            stored = self._stored_features(sample_id, spec.name, spec.version)
+            sealed_keys = {r["feature_key"] for r in stored if r["sealed"]}
+            targets = [key for key in values if key not in sealed_keys]
+        else:
+            unknown = sorted(set(feature_keys) - set(values))
+            if unknown:
+                raise KeyError(f"特征 {spec.name!r} v{spec.version} 不存在 key: {unknown}")
+            targets = list(feature_keys)
+        if targets:
+            self._persist_values(
+                sample_id, spec.name, spec.version, values, evidence, targets, sealed=True
+            )
+        return {key: values[key] for key in targets}
 
     def get_evidence(
         self, sample_id: str, feature_name: str, version: int, *, include_records: bool = True
     ) -> dict[str, dict[str, list[object]]]:
-        """返回冻结特征值使用的账本 seq，可附带原始记录用于重启后审计。"""
-        self._sample(sample_id)
-        frozen_keys = [
-            r["feature_key"]
-            for r in self.conn.execute(
-                "SELECT feature_key FROM sample_features "
-                "WHERE sample_id = ? AND feature_name = ? AND version = ?",
+        """返回特征值使用的账本 seq，可附带原始记录用于重启后审计。
+
+        封存 key 取封存时落库的证据（历史原样）；开放 key 按当前可见
+        账本实时重算，随可见资料修订。
+        """
+        sample = self._sample(sample_id)
+        stored = self._stored_features(sample_id, feature_name, version)
+        if not stored:
+            raise KeyError(f"样本 {sample_id!r} 尚无 {feature_name!r} v{version} 的证据")
+        sealed_keys = [r["feature_key"] for r in stored if r["sealed"]]
+        open_keys = [r["feature_key"] for r in stored if not r["sealed"]]
+        result: dict[str, dict[str, list[object]]] = {
+            key: {"behavior": [], "state": []} for key in sealed_keys
+        }
+        if sealed_keys:
+            rows = self.conn.execute(
+                "SELECT feature_key, seq, role FROM sample_feature_evidence "
+                "WHERE sample_id = ? AND feature_name = ? AND version = ? "
+                "ORDER BY feature_key, role, seq",
                 (sample_id, feature_name, version),
             ).fetchall()
-        ]
-        if not frozen_keys:
-            raise KeyError(f"样本 {sample_id!r} 尚无 {feature_name!r} v{version} 的证据")
-        rows = self.conn.execute(
-            "SELECT feature_key, seq, role FROM sample_feature_evidence "
-            "WHERE sample_id = ? AND feature_name = ? AND version = ? "
-            "ORDER BY feature_key, role, seq",
-            (sample_id, feature_name, version),
-        ).fetchall()
-        result: dict[str, dict[str, list[object]]] = {
-            key: {"behavior": [], "state": []} for key in frozen_keys
-        }
-        seq_by_key: dict[str, list[int]] = {}
-        for row in rows:
-            result[row["feature_key"]][row["role"]].append(row["seq"])
-            seq_by_key.setdefault(row["feature_key"], []).append(row["seq"])
+            for row in rows:
+                if row["feature_key"] in result:
+                    result[row["feature_key"]][row["role"]].append(row["seq"])
+        if open_keys:
+            spec = self._get_spec(feature_name, version)
+            live = self.explain_batch(sample["entity_id"], spec, sample["as_of"])["evidence"]
+            for key in open_keys:
+                result[key] = {
+                    "behavior": list(live[key]["behavior"]),
+                    "state": list(live[key]["state"]),
+                }
         if include_records:
-            all_seqs = sorted({seq for seqs in seq_by_key.values() for seq in seqs})
+            all_seqs = sorted(
+                {seq for roles in result.values() for seqs in roles.values() for seq in seqs}
+            )
             records: dict[int, dict[str, object]] = {}
             if all_seqs:
                 records = {
@@ -344,9 +590,13 @@ class FeatureService:
         return result
 
     def get_features(self, sample_id: str, feature_name: str, version: int) -> dict[str, object]:
-        """读取已冻结的样本特征值（训练时使用的就是这份快照）。"""
+        """读取样本特征值：封存 key 返回历史快照，开放 key 返回当前可见值。
+
+        开放部分只使用 arrival_time <= 样本 as_of 的记录重算，
+        未来才到达的信息不会混入。
+        """
         rows = self.conn.execute(
-            "SELECT feature_key, value FROM sample_features "
+            "SELECT feature_key, value, sealed FROM sample_features "
             "WHERE sample_id = ? AND feature_name = ? AND version = ? ORDER BY feature_key",
             (sample_id, feature_name, version),
         ).fetchall()
@@ -354,7 +604,15 @@ class FeatureService:
             raise KeyError(
                 f"样本 {sample_id!r} 尚未物化 {feature_name!r} v{version}"
             )
-        return {r["feature_key"]: loads(r["value"]) for r in rows}
+        merged = {r["feature_key"]: loads(r["value"]) for r in rows if r["sealed"]}
+        open_keys = [r["feature_key"] for r in rows if not r["sealed"]]
+        if open_keys:
+            sample = self._sample(sample_id)
+            spec = self._get_spec(feature_name, version)
+            current = self.compute_batch(sample["entity_id"], spec, sample["as_of"])
+            for key in open_keys:
+                merged[key] = current[key]
+        return merged
 
     def close(self) -> None:
         self.conn.close()

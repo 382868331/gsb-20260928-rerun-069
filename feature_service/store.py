@@ -69,6 +69,8 @@ CREATE TABLE IF NOT EXISTS sample_features (
     feature_key  TEXT NOT NULL,
     value        TEXT,            -- JSON 标量，空结果为 NULL
     computed_at  INTEGER NOT NULL,
+    sealed       INTEGER NOT NULL DEFAULT 0,  -- 0=开放(随可见修订更新) 1=封存(历史冻结)
+    sealed_at    INTEGER,         -- 封存时点；开放行为 NULL
     PRIMARY KEY (sample_id, feature_name, version, feature_key)
 );
 
@@ -133,6 +135,16 @@ def _migrate_event_log_unique(conn: sqlite3.Connection) -> None:
     conn.execute("DROP TABLE event_log_v1")
 
 
+def _migrate_sample_features_seal(conn: sqlite3.Connection) -> None:
+    """升级旧库：已物化的值是历史封存结果，补录封存标记，原值不动。"""
+    columns = _column_names(conn, "sample_features")
+    if "sealed" in columns:
+        return
+    conn.execute("ALTER TABLE sample_features ADD COLUMN sealed INTEGER NOT NULL DEFAULT 0")
+    conn.execute("ALTER TABLE sample_features ADD COLUMN sealed_at INTEGER")
+    conn.execute("UPDATE sample_features SET sealed = 1, sealed_at = computed_at")
+
+
 def connect(db_path: str | Path) -> sqlite3.Connection:
     path = Path(db_path)
     if path.parent != Path("."):
@@ -143,6 +155,7 @@ def connect(db_path: str | Path) -> sqlite3.Connection:
     conn.executescript(SCHEMA)
     # 兼容首版数据库：新版增加来源维度，但旧数据仍归入 default 来源。
     _migrate_event_log_unique(conn)
+    _migrate_sample_features_seal(conn)
     _add_column(conn, "feature_versions", "sources", "TEXT")
     _add_column(conn, "feature_versions", "state_source", "TEXT")
     _add_column(conn, "feature_versions", "state_field", "TEXT")

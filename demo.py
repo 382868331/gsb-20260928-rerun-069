@@ -46,7 +46,25 @@ def main() -> None:
     print("迟到修订/撤回后旧样本:", still)
     assert still == frozen, "旧训练样本被穿越！"
 
-    # 5) 新样本（as_of=9300）按当时已知重算：e1=15, e2=20, e3已撤回, e4=40
+    # 4.5) 开放 vs 封存：对 as_of 可见的修订会更新开放结果；
+    #      封存前先预览受影响样本/窗口/原因，再确认封存范围
+    svc.ingest("e2", "u1", event_time=150, arrival_time=500, payload={"amount": 25})
+    preview = svc.preview_seal("label_001", "pay", 1)
+    print("封存前预览:", [
+        (c["feature_key"], c["stored_value"], c["current_value"],
+         [r["kind"] for r in c["reasons"]])
+        for c in preview["changes"]
+    ])
+    assert any(c["feature_key"] == "pay_w1000_sum" for c in preview["changes"])
+    svc.seal("label_001", "pay", 1,
+             feature_keys=["pay_w1000_count", "pay_w1000_sum", "pay_w1000_mean"])
+    # 封存后又有可见修订（e1: 10 -> 15）：封存范围保持原值，开放范围继续更新
+    svc.ingest("e1", "u1", event_time=100, arrival_time=600, payload={"amount": 15})
+    sealed_view = svc.get_features("label_001", "pay", 1)
+    print("封存后读取:", sealed_view)
+    assert sealed_view["pay_w1000_sum"] == 65  # 10 + 25 + 30，封存定格
+
+    # 5) 新样本（as_of=9300）按当时已知重算：e1=15, e2=25, e3已撤回, e4=40
     svc.register_sample("label_002", "user", "u1", as_of=9300)
     svc.register_feature(
         "pay", entity="user", windows=[100, 1000, 10000],
@@ -56,8 +74,8 @@ def main() -> None:
     fresh = svc.materialize("label_002", "pay", version=2, batch=True)
     print("as_of=9300 新样本(v2):", fresh)
     assert fresh["pay_w10000_count"] == 3
-    assert fresh["pay_w10000_sum"] == 75
-    assert svc.get_features("label_001", "pay", 1) == frozen
+    assert fresh["pay_w10000_sum"] == 80
+    assert svc.get_features("label_001", "pay", 1) == sealed_view
 
     # 5.5) 多来源时间关联：历史点击 + 观测前最近有效会员状态
     svc.register_feature(
