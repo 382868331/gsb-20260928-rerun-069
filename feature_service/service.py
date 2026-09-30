@@ -26,6 +26,29 @@ class FeatureService:
     def __init__(self, db_path: str | Path = ":memory:"):
         self.conn = connect(db_path)
         self.projection = IncrementalProjection(self.conn)
+        self._ensure_source("default", "event", 0)
+
+    def _ensure_source(self, name: str, kind: str, created_at: int) -> None:
+        row = self.conn.execute("SELECT kind FROM sources WHERE name = ?", (name,)).fetchone()
+        if row is None:
+            self.conn.execute(
+                "INSERT INTO sources (name, kind, created_at) VALUES (?,?,?)",
+                (name, kind, created_at),
+            )
+            self.conn.commit()
+        elif row["kind"] != kind:
+            raise ValueError(f"来源 {name!r} 已注册为 {row['kind']!r}，不能按 {kind!r} 使用")
+
+    def register_source(
+        self, name: str, kind: str, *, created_at: int | None = None
+    ) -> None:
+        """注册数据来源。``kind`` 为 'event'（行为流）或 'state'（状态源）。"""
+        if name == "default":
+            raise ValueError("'default' 是内置行为来源名")
+        if kind not in ("event", "state"):
+            raise ValueError("kind 必须为 'event' 或 'state'")
+        created_at = int(time.time() * 1000) if created_at is None else created_at
+        self._ensure_source(name, kind, created_at)
 
     # ---- 特征定义：版本化、不可变 -------------------------------------
 
@@ -37,6 +60,8 @@ class FeatureService:
         windows: list[int] | tuple[int, ...],
         aggregations: list[str] | tuple[str, ...],
         value_field: str | None = None,
+        event_sources: list[str] | tuple[str, ...] = (),
+        state_sources: list[str] | tuple[str, ...] = (),
         created_at: int | None = None,
     ) -> int:
         """登记或发布新版本的特征定义，返回版本号。
@@ -52,6 +77,12 @@ class FeatureService:
             raise ValueError("aggregations 不能为空")
         for agg in aggregations:
             get_aggregation(agg)  # 未注册会立刻报错
+        event_sources = tuple(event_sources) or ("default",)
+        state_sources = tuple(state_sources)
+        for src in event_sources:
+            self._require_source(src, "event")
+        for src in state_sources:
+            self._require_source(src, "state")
         created_at = int(time.time() * 1000) if created_at is None else created_at
 
         row = self.conn.execute(
@@ -71,6 +102,8 @@ class FeatureService:
                 and tuple(latest.windows) == windows
                 and tuple(latest.aggregations) == aggregations
                 and latest.value_field == value_field
+                and tuple(latest.event_sources) == event_sources
+                and tuple(latest.state_sources) == state_sources
             )
             if same:
                 return version
@@ -82,13 +115,20 @@ class FeatureService:
 
         self.conn.execute(
             "INSERT INTO feature_versions "
-            "(name, version, entity, windows, aggregations, value_field, created_at) "
-            "VALUES (?,?,?,?,?,?,?)",
+            "(name, version, entity, windows, aggregations, value_field, "
+            "event_sources, state_sources, created_at) VALUES (?,?,?,?,?,?,?,?,?)",
             (name, version, entity, dumps(list(windows)), dumps(list(aggregations)),
-             value_field, created_at),
+             value_field, dumps(list(event_sources)), dumps(list(state_sources)), created_at),
         )
         self.conn.commit()
         return version
+
+    def _require_source(self, name: str, kind: str) -> None:
+        row = self.conn.execute("SELECT kind FROM sources WHERE name = ?", (name,)).fetchone()
+        if row is None:
+            raise KeyError(f"来源未注册: {name!r}")
+        if row["kind"] != kind:
+            raise ValueError(f"来源 {name!r} 是 {row['kind']!r}，不能作为 {kind!r} 来源使用")
 
     def list_features(self) -> list[tuple[str, int]]:
         return [
@@ -105,7 +145,8 @@ class FeatureService:
                 raise KeyError(f"特征不存在: {name!r}")
             version = row["current_ver"]
         row = self.conn.execute(
-            "SELECT name, version, entity, windows, aggregations, value_field "
+            "SELECT name, version, entity, windows, aggregations, value_field, "
+            "event_sources, state_sources "
             "FROM feature_versions WHERE name = ? AND version = ?",
             (name, version),
         ).fetchone()
@@ -124,6 +165,7 @@ class FeatureService:
         arrival_time: int,
         payload: dict[str, Any] | None = None,
         op: str = UPSERT,
+        source: str = "default",
     ) -> bool:
         """写入一条原始事件记录。
 
@@ -134,19 +176,26 @@ class FeatureService:
             raise ValueError("op 必须为 UPSERT 或 RETRACT")
         if arrival_time < event_time:
             raise ValueError("arrival_time 早于 event_time：到达不能先于发生")
+        kind = self.conn.execute("SELECT kind FROM sources WHERE name = ?", (source,)).fetchone()
+        if kind is None:
+            raise KeyError(f"来源未注册: {source!r}（先 register_source）")
         cur = self.conn.execute(
             "INSERT OR IGNORE INTO event_log "
-            "(event_id, entity, op, event_time, arrival_time, payload) VALUES (?,?,?,?,?,?)",
-            (event_id, entity, op, event_time, arrival_time,
+            "(source, event_id, entity, op, event_time, arrival_time, payload) "
+            "VALUES (?,?,?,?,?,?,?)",
+            (source, event_id, entity, op, event_time, arrival_time,
              dumps(payload or {})),
         )
         self.conn.commit()
         return cur.rowcount == 1
 
-    def retract(self, event_id: str, entity: str, *, event_time: int, arrival_time: int) -> bool:
+    def retract(
+        self, event_id: str, entity: str, *, event_time: int, arrival_time: int,
+        source: str = "default",
+    ) -> bool:
         return self.ingest(
             event_id, entity, event_time=event_time, arrival_time=arrival_time,
-            payload=None, op=RETRACT,
+            payload=None, op=RETRACT, source=source,
         )
 
     # ---- 人工样本 -----------------------------------------------------
@@ -176,17 +225,27 @@ class FeatureService:
 
     # ---- 计算：两条路径，同一套语义 -----------------------------------
 
-    def compute_incremental(self, entity: str, spec: FeatureSpec, as_of: int) -> dict[str, object]:
+    def compute_incremental(self, entity: str, spec: FeatureSpec, as_of: int) -> dict:
         """增量路径：先把账本新记录追加入投影，再从投影计算。
 
         进程重启后投影和 checkpoint 已持久化，只会处理上次之后的新记录。
         """
         self.projection.catch_up()
-        return compute_from_rows(spec, as_of, self.projection.read_rows(entity))
+        detailed = compute_from_rows(spec, as_of, self.projection.read_rows(entity))
+        return {k: fv.value for k, fv in detailed.items()}
 
-    def compute_batch(self, entity: str, spec: FeatureSpec, as_of: int) -> dict[str, object]:
+    def compute_batch(self, entity: str, spec: FeatureSpec, as_of: int) -> dict:
         """整批路径：跳过一切缓存，直接扫描原始事件账本重放。"""
-        return compute_from_rows(spec, as_of, read_log_rows(self.conn, entity))
+        detailed = compute_from_rows(spec, as_of, read_log_rows(self.conn, entity))
+        return {k: fv.value for k, fv in detailed.items()}
+
+    def _detailed(self, sample, spec: FeatureSpec, batch: bool) -> dict:
+        if batch:
+            rows = read_log_rows(self.conn, sample["entity_id"])
+        else:
+            self.projection.catch_up()
+            rows = self.projection.read_rows(sample["entity_id"])
+        return compute_from_rows(spec, sample["as_of"], rows)
 
     def rebuild_projection(self) -> None:
         """丢弃增量缓存并整批重放（运维/校验用）。"""
@@ -202,13 +261,14 @@ class FeatureService:
         *,
         batch: bool = False,
         recompute: bool = False,
+        sealed: bool = True,
     ) -> dict[str, object]:
-        """为样本物化某特征版本的值并持久化冻结。
+        """为样本物化某特征版本，sealed=True 时封存冻结；False 时可被重算。
 
-        * 一旦物化，值即固定：之后到达的迟到事件/撤回/修订不会改变它；
-        * ``batch=True`` 走整批重放路径，默认走增量路径；
-        * 对同一 (样本, 特征, 版本) 重复物化默认直接返回已冻结的值，
-          仅当 ``recompute=True`` 时才允许重算（用于核对）。
+        * 已封存行：之后到达的更正/撤回一律不改变它，证据也原样保留；
+        * 未封存行：可由 :meth:`recompute_unsealed` 按影响范围重算；
+        * ``recompute=True`` 强制按当前可见账本重算（即使已封存也可覆盖，
+          用于离线核对；默认调用路径不会动封存样本）。
         """
         sample = self._sample(sample_id)
         spec = self._get_spec(feature_name, version)
@@ -218,33 +278,117 @@ class FeatureService:
                 f"样本实体类型 {sample['entity_type']!r} 与特征实体 {spec.entity!r} 不一致"
             )
 
-        frozen = self.conn.execute(
-            "SELECT feature_key, value FROM sample_features "
+        rows_existing = self.conn.execute(
+            "SELECT feature_key, value, sealed FROM sample_features "
             "WHERE sample_id = ? AND feature_name = ? AND version = ?",
             (sample_id, feature_name, version),
         ).fetchall()
-        if frozen and not recompute:
-            return {r["feature_key"]: loads(r["value"]) for r in frozen}
+        if rows_existing and not recompute:
+            if all(r["sealed"] for r in rows_existing):
+                return {r["feature_key"]: loads(r["value"]) for r in rows_existing}
+            if not sealed:
+                return self.recompute_unsealed(sample_id, feature_name, version, batch=batch)
 
-        if batch:
-            values = self.compute_batch(sample["entity_id"], spec, sample["as_of"])
-        else:
-            values = self.compute_incremental(sample["entity_id"], spec, sample["as_of"])
+        values = self._detailed(sample, spec, batch)
 
         now = int(time.time() * 1000)
         self.conn.executemany(
             "INSERT INTO sample_features "
-            "(sample_id, feature_name, version, feature_key, value, computed_at) "
-            "VALUES (?,?,?,?,?,?) "
+            "(sample_id, feature_name, version, feature_key, value, evidence, sealed, computed_at) "
+            "VALUES (?,?,?,?,?,?,?,?) "
             "ON CONFLICT(sample_id, feature_name, version, feature_key) "
-            "DO UPDATE SET value = excluded.value, computed_at = excluded.computed_at",
+            "DO UPDATE SET value = excluded.value, evidence = excluded.evidence, "
+            "sealed = excluded.sealed, computed_at = excluded.computed_at",
             [
-                (sample_id, feature_name, version, key, dumps(value), now)
-                for key, value in values.items()
+                (sample_id, feature_name, version, key, dumps(fv.value),
+                 dumps(list(fv.evidence)), 1 if sealed else 0, now)
+                for key, fv in values.items()
             ],
         )
         self.conn.commit()
-        return values
+        return {key: fv.value for key, fv in values.items()}
+
+    def seal(self, sample_id: str, feature_name: str, version: int) -> None:
+        """封存一份未冻结结果：此后任何更正/撤回都不再改变它。"""
+        cur = self.conn.execute(
+            "UPDATE sample_features SET sealed = 1 "
+            "WHERE sample_id = ? AND feature_name = ? AND version = ? AND sealed = 0",
+            (sample_id, feature_name, version),
+        )
+        self.conn.commit()
+        if cur.rowcount == 0 and not self.conn.execute(
+            "SELECT 1 FROM sample_features "
+            "WHERE sample_id = ? AND feature_name = ? AND version = ?",
+            (sample_id, feature_name, version),
+        ).fetchone():
+            raise KeyError(f"样本 {sample_id!r} 尚未物化 {feature_name!r} v{version}")
+
+    def recompute_unsealed(
+        self, sample_id: str, feature_name: str, version: int, *, batch: bool = False
+    ) -> dict[str, object] | None:
+        """重算单个未封存结果；已封存行原样保留原证据，返回 None。
+
+        来源更正或撤回后可按影响范围调用（只重算受影响实体的样本）。
+        """
+        marker = self.conn.execute(
+            "SELECT MIN(sealed) AS m FROM sample_features "
+            "WHERE sample_id = ? AND feature_name = ? AND version = ?",
+            (sample_id, feature_name, version),
+        ).fetchone()
+        if marker is None or marker["m"] is None:
+            raise KeyError(f"样本 {sample_id!r} 尚未物化 {feature_name!r} v{version}")
+        if marker["m"] == 1:
+            return None  # 已冻结的训练样本保留原证据
+        sample = self._sample(sample_id)
+        spec = self._get_spec(feature_name, version)
+        values = self._detailed(sample, spec, batch)
+        now = int(time.time() * 1000)
+        self.conn.executemany(
+            "UPDATE sample_features SET value = ?, evidence = ?, computed_at = ? "
+            "WHERE sample_id = ? AND feature_name = ? AND version = ? "
+            "AND feature_key = ? AND sealed = 0",
+            [
+                (dumps(fv.value), dumps(list(fv.evidence)), now,
+                 sample_id, feature_name, version, key)
+                for key, fv in values.items()
+            ],
+        )
+        self.conn.commit()
+        return {key: fv.value for key, fv in values.items()}
+
+    def explain(self, sample_id: str, feature_key: str) -> dict[str, object]:
+        """说明一个已物化特征值来自哪些可见账本记录（重启后仍可追溯）。"""
+        row = self.conn.execute(
+            "SELECT feature_name, version, value, evidence, sealed "
+            "FROM sample_features WHERE sample_id = ? AND feature_key = ?",
+            (sample_id, feature_key),
+        ).fetchone()
+        if row is None:
+            raise KeyError(f"样本 {sample_id!r} 未物化特征 {feature_key!r}")
+        seqs = loads(row["evidence"]) or []
+        records = [
+            {
+                "seq": r["seq"], "source": r["source"], "event_id": r["event_id"],
+                "entity": r["entity"], "op": r["op"],
+                "event_time": r["event_time"], "arrival_time": r["arrival_time"],
+                "payload": loads(r["payload"]),
+            }
+            for r in self.conn.execute(
+                f"SELECT seq, source, event_id, entity, op, event_time, arrival_time, payload "
+                f"FROM event_log WHERE seq IN ({','.join('?' * len(seqs))}) ORDER BY seq",
+                tuple(seqs),
+            ).fetchall()
+        ] if seqs else []
+        return {
+            "sample_id": sample_id,
+            "feature_key": feature_key,
+            "feature_name": row["feature_name"],
+            "version": row["version"],
+            "value": loads(row["value"]),
+            "sealed": bool(row["sealed"]),
+            "evidence_seqs": seqs,
+            "records": records,
+        }
 
     def get_features(self, sample_id: str, feature_name: str, version: int) -> dict[str, object]:
         """读取已冻结的样本特征值（训练时使用的就是这份快照）。"""

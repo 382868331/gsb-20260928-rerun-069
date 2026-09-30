@@ -24,6 +24,7 @@ from __future__ import annotations
 import json
 import sqlite3
 from dataclasses import dataclass
+from typing import Any
 
 from .aggregations import get_aggregation
 from .store import dumps, loads
@@ -37,9 +38,12 @@ class FeatureSpec:
     windows: tuple[int, ...]
     aggregations: tuple[str, ...]
     value_field: str | None
+    event_sources: tuple[str, ...] = ("default",)
+    state_sources: tuple[str, ...] = ()
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "FeatureSpec":
+        keys = row.keys()
         return cls(
             name=row["name"],
             version=row["version"],
@@ -47,46 +51,81 @@ class FeatureSpec:
             windows=tuple(json.loads(row["windows"])),
             aggregations=tuple(json.loads(row["aggregations"])),
             value_field=row["value_field"],
+            event_sources=tuple(json.loads(row["event_sources"])) if "event_sources" in keys else ("default",),
+            state_sources=tuple(json.loads(row["state_sources"])) if "state_sources" in keys else (),
         )
 
 
 def feature_keys(spec: FeatureSpec) -> list[str]:
-    return [f"{spec.name}_w{w}_{agg}" for w in spec.windows for agg in spec.aggregations]
+    keys = [f"{spec.name}_w{w}_{agg}" for w in spec.windows for agg in spec.aggregations]
+    keys.extend(f"{spec.name}_state_{src}" for src in spec.state_sources)
+    return keys
 
 
-def _reduce_visible(rows: list[sqlite3.Row], value_field: str | None) -> list[tuple[int, float]]:
-    """把账本行归约成 (event_time, value) 的当前有效事件列表。"""
-    latest: dict[str, sqlite3.Row] = {}
-    for row in rows:  # 已按 seq 升序
-        latest[row["event_id"]] = row
-    out: list[tuple[int, float]] = []
-    for row in latest.values():
-        if row["op"] == "RETRACT":
-            continue
-        if value_field is None:
-            value: float = 1.0
-        else:
-            payload = loads(row["payload"])
-            value = payload[value_field]
-        out.append((row["event_time"], float(value)))
-    return out
+@dataclass(frozen=True)
+class FeatureValue:
+    value: object
+    evidence: tuple[int, ...]  # 产出该值的账本 seq（winning 版本）
 
 
-def compute_from_rows(spec: FeatureSpec, as_of: int, rows: list[sqlite3.Row]) -> dict[str, object]:
-    """纯函数：账本行（已按 as_of 过滤或自带过滤）→ 特征值字典。
+def _field_value(row: sqlite3.Row, value_field: str | None) -> float:
+    if value_field is None:
+        return 1.0
+    return float(loads(row["payload"])[value_field])
+
+
+def _winners(visible_rows: list[sqlite3.Row]) -> list[sqlite3.Row]:
+    """按 (source, event_id) 归约，返回每个业务身份的当前有效版本。
+
+    重复身份冲突：同一业务身份的多条 UPSERT 并非重复投递（op/event_time/
+    到达时间或负载不同），按账本 seq（写入顺序）归约到最后一条——
+    即“后到的更正覆盖早先值”，且该覆盖同样受 arrival_time 约束。
+    RETRACT 胜出时该身份无效（被撤回）。
+    """
+    latest: dict[tuple[str, str], sqlite3.Row] = {}
+    for row in visible_rows:  # 已按 seq 升序
+        latest[(row["source"], row["event_id"])] = row
+    return [r for r in latest.values() if r["op"] != "RETRACT"]
+
+
+def compute_from_rows(
+    spec: FeatureSpec, as_of: int, rows: list[sqlite3.Row]
+) -> dict[str, FeatureValue]:
+    """纯函数：账本行 → {feature_key: FeatureValue(value, evidence)}。
 
     批路径与增量路径都调用本函数，保证两条路径同一套语义。
+    evidence 是产出每个值的账本 seq 列表：逐条接入与整批重放必须一致，
+    重启后仍能据此说明特征值来自哪些可见记录。
     """
     visible_rows = [r for r in rows if r["arrival_time"] <= as_of]
-    events = _reduce_visible(visible_rows, spec.value_field)
-    result: dict[str, object] = {}
+    event_winners = _winners([r for r in visible_rows if r["source"] in spec.event_sources])
+    state_winners = _winners([r for r in visible_rows if r["source"] in spec.state_sources])
+    result: dict[str, FeatureValue] = {}
+
+    # 行为源：滚动窗口 [as_of - window, as_of)，左闭右开。
+    # 边界时刻相同的消息：event_time == as_of - window 计入，== as_of 不计入。
     for window in spec.windows:
         lo, hi = as_of - window, as_of
-        values = [v for et, v in events if lo <= et < hi]
+        in_window = [r for r in event_winners if lo <= r["event_time"] < hi]
         for agg_name in spec.aggregations:
             agg = get_aggregation(agg_name)
             key = f"{spec.name}_w{window}_{agg_name}"
-            result[key] = agg.compute(values) if values else agg.empty
+            if in_window:
+                value = agg.compute([_field_value(r, spec.value_field) for r in in_window])
+            else:
+                value = agg.empty
+            result[key] = FeatureValue(value, tuple(sorted(r["seq"] for r in in_window)))
+
+    # 状态源：as_of 之前同一实体最近一次“有效状态”（event_time <= as_of）。
+    # 同 event_time 的多条状态按 seq 决胜（后写入的更正为准）。
+    for src in spec.state_sources:
+        key = f"{spec.name}_state_{src}"
+        candidates = [r for r in state_winners if r["source"] == src and r["event_time"] <= as_of]
+        if candidates:
+            chosen = max(candidates, key=lambda r: (r["event_time"], r["seq"]))
+            result[key] = FeatureValue(_field_value(chosen, spec.value_field), (chosen["seq"],))
+        else:
+            result[key] = FeatureValue(None, ())
     return result
 
 
@@ -103,6 +142,7 @@ class IncrementalProjection:
         conn.execute(
             """CREATE TABLE IF NOT EXISTS projection_entries (
                 seq          INTEGER PRIMARY KEY,
+                source       TEXT NOT NULL,
                 event_id     TEXT NOT NULL,
                 entity       TEXT NOT NULL,
                 op           TEXT NOT NULL,
@@ -125,16 +165,16 @@ class IncrementalProjection:
         """把 checkpoint 之后的账本记录追加进镜像，返回新的 last_seq。"""
         last_seq = self.checkpoint()
         rows = self.conn.execute(
-            "SELECT seq, event_id, entity, op, event_time, arrival_time, payload "
+            "SELECT seq, source, event_id, entity, op, event_time, arrival_time, payload "
             "FROM event_log WHERE seq > ? ORDER BY seq",
             (last_seq,),
         ).fetchall()
         self.conn.executemany(
             "INSERT OR IGNORE INTO projection_entries "
-            "(seq, event_id, entity, op, event_time, arrival_time, payload) "
-            "VALUES (?,?,?,?,?,?,?)",
+            "(seq, source, event_id, entity, op, event_time, arrival_time, payload) "
+            "VALUES (?,?,?,?,?,?,?,?)",
             [
-                (r["seq"], r["event_id"], r["entity"], r["op"], r["event_time"],
+                (r["seq"], r["source"], r["event_id"], r["entity"], r["op"], r["event_time"],
                  r["arrival_time"], r["payload"])
                 for r in rows
             ],
@@ -158,7 +198,7 @@ class IncrementalProjection:
 
     def read_rows(self, entity: str) -> list[sqlite3.Row]:
         return self.conn.execute(
-            "SELECT event_id, entity, op, event_time, arrival_time, payload "
+            "SELECT seq, source, event_id, entity, op, event_time, arrival_time, payload "
             "FROM projection_entries WHERE entity = ? ORDER BY seq",
             (entity,),
         ).fetchall()
@@ -167,7 +207,7 @@ class IncrementalProjection:
 def read_log_rows(conn: sqlite3.Connection, entity: str) -> list[sqlite3.Row]:
     """整批路径：直接读原始事件账本。"""
     return conn.execute(
-        "SELECT event_id, entity, op, event_time, arrival_time, payload "
+        "SELECT seq, source, event_id, entity, op, event_time, arrival_time, payload "
         "FROM event_log WHERE entity = ? ORDER BY seq",
         (entity,),
     ).fetchall()

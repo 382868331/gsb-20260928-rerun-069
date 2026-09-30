@@ -71,6 +71,41 @@ def main() -> None:
     assert svc2.compute_incremental("u1", spec, 9300) == svc2.compute_batch("u1", spec, 9300)
     print("重启后增量 == 整批，且缓存重建结果一致 ✓")
     svc2.close()
+
+    # 7) 多来源时间关联：观测前同一实体“最近一次有效状态” + 一段行为历史
+    svc = FeatureService(db)  # 再次模拟重启
+    svc.register_source("risk", "state", created_at=10)
+    svc.register_source("click", "event", created_at=10)
+    v3 = svc.register_feature(
+        "ctx", entity="user", windows=[1000],
+        aggregations=["count", "sum"], value_field="amount",
+        event_sources=["click"], state_sources=["risk"], created_at=10,
+    )
+    # 乱序状态：先到 150 的状态，100 的旧状态更晚才到达
+    svc.ingest("r2", "u1", source="risk", event_time=150, arrival_time=300,
+               payload={"amount": 2})
+    svc.ingest("r1", "u1", source="risk", event_time=100, arrival_time=400,
+               payload={"amount": 1})
+    svc.ingest("k1", "u1", source="click", event_time=50, arrival_time=60,
+               payload={"amount": 7})
+    svc.register_sample("obs", "user", "u1", as_of=1000)
+    obs = svc.materialize("obs", "ctx", version=v3, sealed=False)
+    print("观测前关联（最近状态 + 行为窗口）:", obs)
+    assert obs["ctx_state_risk"] == 2      # 最近有效状态 event_time=150
+    assert obs["ctx_w1000_count"] == 1
+
+    # 8) 未封存结果随来源更正重算；血缘说明每个值来自哪些记录
+    svc.ingest("r2", "u1", source="risk", event_time=150, arrival_time=900,
+               payload={"amount": 5})
+    fixed = svc.recompute_unsealed("obs", "ctx", v3)
+    print("来源更正后未封存结果重算:", fixed)
+    assert fixed["ctx_state_risk"] == 5
+    why = svc.explain("obs", "ctx_state_risk")
+    print("特征值血缘:", why["evidence_seqs"], why["records"])
+    svc.seal("obs", "ctx", v3)
+    assert svc.recompute_unsealed("obs", "ctx", v3) is None
+    assert svc.get_features("label_001", "pay", 1) == frozen
+    print("封存后保留原证据，已冻结训练样本不变 ✓")
     tmp.cleanup()
 
 

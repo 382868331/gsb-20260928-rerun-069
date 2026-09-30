@@ -36,19 +36,28 @@ CREATE TABLE IF NOT EXISTS feature_versions (
     windows       TEXT NOT NULL,   -- JSON list[int]，毫秒窗口
     aggregations  TEXT NOT NULL,   -- JSON list[str]
     value_field   TEXT,            -- 取值字段，count 时可为 NULL
+    event_sources TEXT NOT NULL DEFAULT '[]',   -- JSON list[str]，行为来源
+    state_sources TEXT NOT NULL DEFAULT '[]',   -- JSON list[str]，状态来源
     created_at    INTEGER NOT NULL,
     PRIMARY KEY (name, version)
 );
 
+CREATE TABLE IF NOT EXISTS sources (
+    name       TEXT PRIMARY KEY,
+    kind       TEXT NOT NULL CHECK (kind IN ('event', 'state')),
+    created_at INTEGER NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS event_log (
     seq          INTEGER PRIMARY KEY AUTOINCREMENT,
+    source       TEXT NOT NULL DEFAULT 'default',
     event_id     TEXT NOT NULL,
     entity       TEXT NOT NULL,
     op           TEXT NOT NULL CHECK (op IN ('UPSERT', 'RETRACT')),
     event_time   INTEGER NOT NULL,
     arrival_time INTEGER NOT NULL,
     payload      TEXT NOT NULL,    -- JSON 对象
-    UNIQUE (event_id, entity, op, event_time, arrival_time)
+    UNIQUE (source, event_id, entity, op, event_time, arrival_time, payload)
 );
 
 CREATE TABLE IF NOT EXISTS samples (
@@ -64,6 +73,8 @@ CREATE TABLE IF NOT EXISTS sample_features (
     version      INTEGER NOT NULL,
     feature_key  TEXT NOT NULL,
     value        TEXT,            -- JSON 标量，空结果为 NULL
+    evidence     TEXT NOT NULL DEFAULT '[]',  -- 产出该值的账本 seq 列表
+    sealed       INTEGER NOT NULL DEFAULT 1,  -- 1=封存冻结，0=未封存可重算
     computed_at  INTEGER NOT NULL,
     PRIMARY KEY (sample_id, feature_name, version, feature_key)
 );
