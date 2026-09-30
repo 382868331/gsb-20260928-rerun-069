@@ -198,6 +198,105 @@ class FeatureServiceTest(unittest.TestCase):
         late = s.compute_batch("u1", spec, 9100)["pay_d_w10000_stddev"]
         self.assertNotAlmostEqual(early, late)
 
+    def test_empty_result_evidence_is_explicit(self):
+        self.svc.register_sample("empty", "user", "u1", 100)
+        self.svc.materialize("empty", "pay")
+        evidence = self.svc.get_evidence("empty", "pay", 1, include_records=False)
+        self.assertEqual(evidence["pay_w100_count"], {"behavior": [], "state": []})
+        self.assertEqual(evidence["pay_w100_sum"], {"behavior": [], "state": []})
+
+    def test_multi_source_time_join_boundaries_and_lineage(self):
+        s = self.svc
+        version = s.register_feature(
+            "profile", entity="user", windows=[100],
+            aggregations=["count", "sum"], value_field="amount",
+            sources=("click",), state_source="status", state_field="tier",
+            created_at=10,
+        )
+        spec = s._get_spec("profile", version)
+
+        # 两条状态 event_time/arrival_time 完全相同：同一来源同键冲突按账本顺序
+        # 取最后一条；事件时间恰为 as_of 的状态可用。
+        s.ingest("s1", "u1", source="status", event_time=100, arrival_time=100,
+                 payload={"tier": "A"})
+        s.ingest("s2", "u1", source="status", event_time=100, arrival_time=100,
+                 payload={"tier": "B"})
+        s.ingest("click-1", "u1", source="click", event_time=50, arrival_time=50,
+                 payload={"amount": 5})
+        # event_time=as_of 的行为落在右边界，左闭右开，不计入。
+        s.ingest("click-2", "u1", source="click", event_time=100, arrival_time=100,
+                 payload={"amount": 7})
+        # 不同来源复用相同业务 ID 不互相抵消；purchase 也不在 profile.sources 中。
+        s.ingest("click-1", "u1", source="purchase", event_time=50, arrival_time=50,
+                 payload={"amount": 999})
+        # 状态事件时间更早，但到达晚于观测点，不能参与 as_of=100。
+        s.ingest("s0", "u1", source="status", event_time=90, arrival_time=101,
+                 payload={"tier": "C"})
+
+        expected = {
+            "profile_w100_count": 1,
+            "profile_w100_sum": 5,
+            "profile_last_state": "B",
+        }
+        inc = s.explain_incremental("u1", spec, 100)
+        bat = s.explain_batch("u1", spec, 100)
+        self.assertEqual(inc["values"], expected)
+        self.assertEqual(bat["values"], expected)
+        self.assertEqual(inc["evidence"], bat["evidence"])
+
+        s.register_sample("old", "user", "u1", 100)
+        frozen = s.materialize("old", "profile", version)
+        self.assertEqual(frozen, expected)
+        before_evidence = s.get_evidence("old", "profile", version, include_records=False)
+        self.assertEqual(
+            before_evidence["profile_w100_sum"]["behavior"],
+            [inc["evidence"]["profile_w100_sum"]["behavior"][0]],
+        )
+        self.assertEqual(
+            before_evidence["profile_last_state"]["state"],
+            [inc["evidence"]["profile_last_state"]["state"][0]],
+        )
+
+        # 来源更正/撤回在 101 后可见：新样本重算为右边界行为和更早但后到的状态。
+        self.assertTrue(
+            s.retract("click-1", "u1", source="click", event_time=50, arrival_time=101)
+        )
+        self.assertTrue(
+            s.retract("s2", "u1", source="status", event_time=100, arrival_time=101)
+        )
+        self.assertTrue(
+            s.retract("s1", "u1", source="status", event_time=100, arrival_time=101)
+        )
+        s.register_sample("new", "user", "u1", 200)
+        fresh = s.materialize("new", "profile", version, batch=True)
+        self.assertEqual(fresh["profile_w100_count"], 1)
+        self.assertEqual(fresh["profile_w100_sum"], 7)
+        self.assertEqual(fresh["profile_last_state"], "C")
+
+        # 已冻结样本的值与证据均不被影响范围重算改写；recompute 只返回对照。
+        comparison = s.materialize("old", "profile", version, recompute=True)
+        self.assertEqual(comparison["frozen"], expected)
+        self.assertEqual(s.get_features("old", "profile", version), expected)
+        self.assertEqual(
+            s.get_evidence("old", "profile", version, include_records=False),
+            before_evidence,
+        )
+
+        # 重启后仍能从冻结证据还原每个值来自哪些当时可见的原始记录。
+        s.close()
+        reopened = FeatureService(self.db)
+        records = reopened.get_evidence("old", "profile", version)
+        self.assertEqual(
+            records["profile_w100_sum"]["behavior"][0]["source"], "click"
+        )
+        self.assertEqual(
+            records["profile_w100_sum"]["behavior"][0]["payload"]["amount"], 5
+        )
+        self.assertEqual(
+            records["profile_last_state"]["state"][0]["payload"]["tier"], "B"
+        )
+        reopened.close()
+
 
 if __name__ == "__main__":
     unittest.main()

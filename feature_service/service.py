@@ -11,6 +11,7 @@ from .engine import (
     FeatureSpec,
     IncrementalProjection,
     compute_from_rows,
+    explain_from_rows,
     read_log_rows,
 )
 from .store import connect, dumps, loads
@@ -37,6 +38,9 @@ class FeatureService:
         windows: list[int] | tuple[int, ...],
         aggregations: list[str] | tuple[str, ...],
         value_field: str | None = None,
+        sources: list[str] | tuple[str, ...] = ("default",),
+        state_source: str | None = None,
+        state_field: str | None = None,
         created_at: int | None = None,
     ) -> int:
         """登记或发布新版本的特征定义，返回版本号。
@@ -46,10 +50,15 @@ class FeatureService:
         """
         windows = tuple(windows)
         aggregations = tuple(aggregations)
+        sources = tuple(sources)
         if not windows or any(w <= 0 for w in windows):
             raise ValueError("windows 必须为正整数列表")
         if not aggregations:
             raise ValueError("aggregations 不能为空")
+        if not sources:
+            raise ValueError("sources 不能为空")
+        if state_source is not None and state_field is None:
+            raise ValueError("配置 state_source 时必须指定 state_field")
         for agg in aggregations:
             get_aggregation(agg)  # 未注册会立刻报错
         created_at = int(time.time() * 1000) if created_at is None else created_at
@@ -71,6 +80,9 @@ class FeatureService:
                 and tuple(latest.windows) == windows
                 and tuple(latest.aggregations) == aggregations
                 and latest.value_field == value_field
+                and latest.sources == sources
+                and latest.state_source == state_source
+                and latest.state_field == state_field
             )
             if same:
                 return version
@@ -82,10 +94,11 @@ class FeatureService:
 
         self.conn.execute(
             "INSERT INTO feature_versions "
-            "(name, version, entity, windows, aggregations, value_field, created_at) "
-            "VALUES (?,?,?,?,?,?,?)",
+            "(name, version, entity, windows, aggregations, value_field, sources, "
+            "state_source, state_field, created_at) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?)",
             (name, version, entity, dumps(list(windows)), dumps(list(aggregations)),
-             value_field, created_at),
+             value_field, dumps(list(sources)), state_source, state_field, created_at),
         )
         self.conn.commit()
         return version
@@ -105,7 +118,8 @@ class FeatureService:
                 raise KeyError(f"特征不存在: {name!r}")
             version = row["current_ver"]
         row = self.conn.execute(
-            "SELECT name, version, entity, windows, aggregations, value_field "
+            "SELECT name, version, entity, windows, aggregations, value_field, "
+            "sources, state_source, state_field "
             "FROM feature_versions WHERE name = ? AND version = ?",
             (name, version),
         ).fetchone()
@@ -124,6 +138,7 @@ class FeatureService:
         arrival_time: int,
         payload: dict[str, Any] | None = None,
         op: str = UPSERT,
+        source: str = "default",
     ) -> bool:
         """写入一条原始事件记录。
 
@@ -136,17 +151,26 @@ class FeatureService:
             raise ValueError("arrival_time 早于 event_time：到达不能先于发生")
         cur = self.conn.execute(
             "INSERT OR IGNORE INTO event_log "
-            "(event_id, entity, op, event_time, arrival_time, payload) VALUES (?,?,?,?,?,?)",
-            (event_id, entity, op, event_time, arrival_time,
+            "(event_id, entity, source, op, event_time, arrival_time, payload) "
+            "VALUES (?,?,?,?,?,?,?)",
+            (event_id, entity, source, op, event_time, arrival_time,
              dumps(payload or {})),
         )
         self.conn.commit()
         return cur.rowcount == 1
 
-    def retract(self, event_id: str, entity: str, *, event_time: int, arrival_time: int) -> bool:
+    def retract(
+        self,
+        event_id: str,
+        entity: str,
+        *,
+        event_time: int,
+        arrival_time: int,
+        source: str = "default",
+    ) -> bool:
         return self.ingest(
             event_id, entity, event_time=event_time, arrival_time=arrival_time,
-            payload=None, op=RETRACT,
+            payload=None, op=RETRACT, source=source,
         )
 
     # ---- 人工样本 -----------------------------------------------------
@@ -188,6 +212,13 @@ class FeatureService:
         """整批路径：跳过一切缓存，直接扫描原始事件账本重放。"""
         return compute_from_rows(spec, as_of, read_log_rows(self.conn, entity))
 
+    def explain_incremental(self, entity: str, spec: FeatureSpec, as_of: int) -> dict[str, object]:
+        self.projection.catch_up()
+        return explain_from_rows(spec, as_of, self.projection.read_rows(entity))
+
+    def explain_batch(self, entity: str, spec: FeatureSpec, as_of: int) -> dict[str, object]:
+        return explain_from_rows(spec, as_of, read_log_rows(self.conn, entity))
+
     def rebuild_projection(self) -> None:
         """丢弃增量缓存并整批重放（运维/校验用）。"""
         self.projection.rebuild()
@@ -207,8 +238,8 @@ class FeatureService:
 
         * 一旦物化，值即固定：之后到达的迟到事件/撤回/修订不会改变它；
         * ``batch=True`` 走整批重放路径，默认走增量路径；
-        * 对同一 (样本, 特征, 版本) 重复物化默认直接返回已冻结的值，
-          仅当 ``recompute=True`` 时才允许重算（用于核对）。
+        * 同一 (样本, 特征, 版本) 一经物化即封存，之后永不改写；
+        * ``recompute=True`` 只用于临时核对当前账本，不会覆盖冻结快照。
         """
         sample = self._sample(sample_id)
         spec = self._get_spec(feature_name, version)
@@ -223,13 +254,22 @@ class FeatureService:
             "WHERE sample_id = ? AND feature_name = ? AND version = ?",
             (sample_id, feature_name, version),
         ).fetchall()
-        if frozen and not recompute:
-            return {r["feature_key"]: loads(r["value"]) for r in frozen}
+        if frozen:
+            frozen_values = {r["feature_key"]: loads(r["value"]) for r in frozen}
+            if not recompute:
+                return frozen_values
+            if batch:
+                current = self.compute_batch(sample["entity_id"], spec, sample["as_of"])
+            else:
+                current = self.compute_incremental(sample["entity_id"], spec, sample["as_of"])
+            return {"frozen": frozen_values, "current": current}
 
         if batch:
-            values = self.compute_batch(sample["entity_id"], spec, sample["as_of"])
+            explained = self.explain_batch(sample["entity_id"], spec, sample["as_of"])
         else:
-            values = self.compute_incremental(sample["entity_id"], spec, sample["as_of"])
+            explained = self.explain_incremental(sample["entity_id"], spec, sample["as_of"])
+        values = explained["values"]
+        evidence = explained["evidence"]
 
         now = int(time.time() * 1000)
         self.conn.executemany(
@@ -243,8 +283,65 @@ class FeatureService:
                 for key, value in values.items()
             ],
         )
+        self.conn.executemany(
+            "INSERT INTO sample_feature_evidence "
+            "(sample_id, feature_name, version, feature_key, seq, role) "
+            "VALUES (?,?,?,?,?,?)",
+            [
+                (sample_id, feature_name, version, key, seq, role)
+                for key, roles in evidence.items()
+                for role, seqs in roles.items()
+                for seq in seqs
+            ],
+        )
         self.conn.commit()
         return values
+
+    def get_evidence(
+        self, sample_id: str, feature_name: str, version: int, *, include_records: bool = True
+    ) -> dict[str, dict[str, list[object]]]:
+        """返回冻结特征值使用的账本 seq，可附带原始记录用于重启后审计。"""
+        self._sample(sample_id)
+        frozen_keys = [
+            r["feature_key"]
+            for r in self.conn.execute(
+                "SELECT feature_key FROM sample_features "
+                "WHERE sample_id = ? AND feature_name = ? AND version = ?",
+                (sample_id, feature_name, version),
+            ).fetchall()
+        ]
+        if not frozen_keys:
+            raise KeyError(f"样本 {sample_id!r} 尚无 {feature_name!r} v{version} 的证据")
+        rows = self.conn.execute(
+            "SELECT feature_key, seq, role FROM sample_feature_evidence "
+            "WHERE sample_id = ? AND feature_name = ? AND version = ? "
+            "ORDER BY feature_key, role, seq",
+            (sample_id, feature_name, version),
+        ).fetchall()
+        result: dict[str, dict[str, list[object]]] = {
+            key: {"behavior": [], "state": []} for key in frozen_keys
+        }
+        seq_by_key: dict[str, list[int]] = {}
+        for row in rows:
+            result[row["feature_key"]][row["role"]].append(row["seq"])
+            seq_by_key.setdefault(row["feature_key"], []).append(row["seq"])
+        if include_records:
+            all_seqs = sorted({seq for seqs in seq_by_key.values() for seq in seqs})
+            records: dict[int, dict[str, object]] = {}
+            if all_seqs:
+                records = {
+                    r["seq"]: {**dict(r), "payload": loads(r["payload"])}
+                    for r in self.conn.execute(
+                        "SELECT seq, event_id, entity, source, op, event_time, arrival_time, payload "
+                        "FROM event_log WHERE seq IN (%s) ORDER BY seq"
+                        % ",".join("?" for _ in all_seqs),
+                        all_seqs,
+                    ).fetchall()
+                }
+            for payload_roles in result.values():
+                for role, seqs in payload_roles.items():
+                    payload_roles[role] = [records[seq] for seq in seqs]
+        return result
 
     def get_features(self, sample_id: str, feature_name: str, version: int) -> dict[str, object]:
         """读取已冻结的样本特征值（训练时使用的就是这份快照）。"""

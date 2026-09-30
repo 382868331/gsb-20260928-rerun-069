@@ -59,6 +59,27 @@ def main() -> None:
     assert fresh["pay_w10000_sum"] == 75
     assert svc.get_features("label_001", "pay", 1) == frozen
 
+    # 5.5) 多来源时间关联：历史点击 + 观测前最近有效会员状态
+    svc.register_feature(
+        "profile", entity="user", windows=[10000],
+        aggregations=["count", "sum"], value_field="amount",
+        sources=("click",), state_source="membership", state_field="tier",
+        created_at=2,
+    )
+    svc.ingest("c1", "u1", source="click", event_time=800, arrival_time=800,
+               payload={"amount": 7})
+    svc.ingest("m1", "u1", source="membership", event_time=700, arrival_time=700,
+               payload={"tier": "silver"})
+    # 事件时间更早但晚到：对 as_of=9300 不可见
+    svc.ingest("m0", "u1", source="membership", event_time=600, arrival_time=9400,
+               payload={"tier": "gold"})
+    svc.register_sample("profile_old", "user", "u1", as_of=9300)
+    joined = svc.materialize("profile_old", "profile", version=1)
+    print("多来源 as_of=9300 冻结:", joined)
+    assert joined["profile_w10000_count"] == 1
+    assert joined["profile_w10000_sum"] == 7
+    assert joined["profile_last_state"] == "silver"
+
     # 6) 模拟重启：增量投影与整批重放必须一致
     svc.close()
     svc2 = FeatureService(db)
