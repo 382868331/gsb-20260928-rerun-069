@@ -273,10 +273,22 @@ class FeatureServiceTest(unittest.TestCase):
         self.assertEqual(fresh["profile_w100_sum"], 7)
         self.assertEqual(fresh["profile_last_state"], "C")
 
-        # 已冻结样本的值与证据均不被影响范围重算改写；recompute 只返回对照。
-        comparison = s.materialize("old", "profile", version, recompute=True)
-        self.assertEqual(comparison["frozen"], expected)
+        # 撤回在 101 才到达，对 as_of=100 不可见：预览无变化，重算保持原值。
+        preview = s.preview_seal("old", "profile", version)
+        self.assertFalse(any(e["changed"] for e in preview["entries"]))
+        again = s.materialize("old", "profile", version)
+        self.assertEqual(again, expected)
         self.assertEqual(s.get_features("old", "profile", version), expected)
+        self.assertEqual(
+            s.get_evidence("old", "profile", version, include_records=False),
+            before_evidence,
+        )
+
+        # 封存后，即使追加当时可见（arrival_time <= as_of）的撤回也不改写。
+        s.seal("old", "profile", version)
+        s.retract("click-2", "u1", source="click", event_time=100, arrival_time=100)
+        sealed = s.materialize("old", "profile", version)
+        self.assertEqual(sealed, expected)
         self.assertEqual(
             s.get_evidence("old", "profile", version, include_records=False),
             before_evidence,
@@ -296,6 +308,97 @@ class FeatureServiceTest(unittest.TestCase):
             records["profile_last_state"]["state"][0]["payload"]["tier"], "B"
         )
         reopened.close()
+
+    def test_open_results_update_by_scope_and_seal_freezes_rest(self):
+        s = self.svc
+        s.ingest("e1", "u1", event_time=100, arrival_time=100, payload={"amount": 10})
+        s.ingest("e2", "u1", event_time=150, arrival_time=160, payload={"amount": 20})
+        s.register_sample("s1", "user", "u1", 200)
+        v = s.materialize("s1", "pay")
+        self.assertEqual(v["pay_w100_count"], 2)
+        self.assertEqual(v["pay_w100_sum"], 30)
+        self.assertEqual(v["pay_w100_mean"], 15)
+
+        # 账本后来才追加、但当时可见（arrival_time <= as_of=200）的修订与撤回
+        s.ingest("e1", "u1", event_time=100, arrival_time=170, payload={"amount": 15})
+        s.retract("e2", "u1", event_time=150, arrival_time=180)
+
+        # 封存前预览：看到受影响窗口与原因，mean 恰好不变则不在影响范围内
+        preview = s.preview_seal("s1", "pay", 1)
+        changed = {e["feature_key"]: e for e in preview["entries"] if e["changed"]}
+        self.assertEqual(changed["pay_w100_count"]["current"], 1)
+        self.assertEqual(changed["pay_w100_sum"]["current"], 15)
+        self.assertIn("retract", changed["pay_w100_count"]["reasons"])
+        self.assertIn("revision", changed["pay_w100_sum"]["reasons"])
+        unchanged = {e["feature_key"] for e in preview["entries"] if not e["changed"]}
+        self.assertIn("pay_w100_mean", unchanged)
+
+        # 只确认封存 sum；其余范围仍开放，随可见修订更新
+        s.seal("s1", "pay", 1, feature_keys=["pay_w100_sum"], sealed_at=5000)
+        s.ingest("e1", "u1", event_time=100, arrival_time=190, payload={"amount": 20})
+        v2 = s.materialize("s1", "pay")
+        self.assertEqual(v2["pay_w100_sum"], 15)   # 封存：保持原样
+        self.assertEqual(v2["pay_w100_mean"], 20)  # 开放：按影响范围更新
+        self.assertEqual(v2["pay_w100_count"], 1)
+        status = s.seal_status("s1", "pay", 1)
+        self.assertEqual(status["pay_w100_sum"], "sealed")
+        self.assertEqual(status["pay_w100_mean"], "open")
+        # 已封存范围不能再次封存或改写
+        with self.assertRaises(ValueError):
+            s.seal("s1", "pay", 1, feature_keys=["pay_w100_sum"])
+
+    def test_late_data_and_window_change_only_touch_open_visible_scope(self):
+        s = self.svc
+        self.feed_base_events()  # e4 900 发生、9000 才到达
+        s.register_sample("old", "user", "u1", 1000)
+        v1 = s.materialize("old", "pay")
+        self.assertEqual(v1["pay_w1000_count"], 3)
+        # 未来才到达的信息不混入开放结果
+        self.assertEqual(s.materialize("old", "pay"), v1)
+        # 封存 w1000 范围，w100 范围保持开放
+        s.seal("old", "pay", 1,
+               feature_keys=[k for k in v1 if "_w1000_" in k], sealed_at=6000)
+        # 窗口边界变化 -> 新版本；旧版本封存范围保持原样
+        v2num = s.register_feature(
+            "pay", entity="user", windows=[100, 500, 1000],
+            aggregations=["count", "sum", "mean"], value_field="amount",
+            created_at=7,
+        )
+        self.assertEqual(v2num, 2)
+        v2 = s.materialize("old", "pay", 2)
+        self.assertIn("pay_w500_count", v2)
+        self.assertEqual(s.get_features("old", "pay", 1)["pay_w1000_count"], 3)
+        status = s.seal_status("old", "pay", 1)
+        self.assertEqual(status["pay_w1000_sum"], "sealed")
+        self.assertEqual(status["pay_w100_count"], "open")
+
+    def test_seal_decisions_and_history_survive_restart(self):
+        s = self.svc
+        s.ingest("e1", "u1", event_time=100, arrival_time=100, payload={"amount": 10})
+        s.register_sample("s1", "user", "u1", 200)
+        s.materialize("s1", "pay")
+        s.seal("s1", "pay", 1, feature_keys=["pay_w100_sum"], sealed_at=12345)
+        ev_before = s.get_evidence("s1", "pay", 1, include_records=False)
+        s.close()
+
+        s2 = FeatureService(self.db)
+        # 重启后：封存决定、历史值与证据全部保留
+        self.assertEqual(s2.seal_status("s1", "pay", 1)["pay_w100_sum"], "sealed")
+        self.assertEqual(s2.get_features("s1", "pay", 1)["pay_w100_sum"], 10)
+        self.assertEqual(
+            s2.get_evidence("s1", "pay", 1, include_records=False), ev_before
+        )
+        row = s2.conn.execute(
+            "SELECT sealed_at FROM sample_features "
+            "WHERE sample_id = 's1' AND feature_key = 'pay_w100_sum'"
+        ).fetchone()
+        self.assertEqual(row["sealed_at"], 12345)
+        # 当时可见的修订只更新仍开放的范围
+        s2.ingest("e1", "u1", event_time=100, arrival_time=150, payload={"amount": 30})
+        v = s2.materialize("s1", "pay")
+        self.assertEqual(v["pay_w100_sum"], 10)   # 封存历史原样
+        self.assertEqual(v["pay_w100_mean"], 30)  # 开放范围更新
+        s2.close()
 
 
 if __name__ == "__main__":

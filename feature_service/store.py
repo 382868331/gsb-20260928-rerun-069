@@ -8,7 +8,9 @@
    原始事件账本，append-only。UPSERT/RETRACT 是账本上的新记录，
    历史记录永不删除，保证可以完整重放。
 3. ``sample_features``
-   每次按特征版本物化出的样本特征值，随版本冻结。
+   每次按特征版本物化出的样本特征值。结果分**开放**与**封存**两态：
+   开放结果随当时可见的账本修订按影响范围更新；封存结果保持原样，
+   封存决定（status / sealed_at）与值、证据一起持久化，重启后不丢失。
 
 增量计算缓存（``projection_entries`` / ``checkpoint``）由引擎层创建，
 随时可以删除并由账本整批重放重建。
@@ -69,6 +71,9 @@ CREATE TABLE IF NOT EXISTS sample_features (
     feature_key  TEXT NOT NULL,
     value        TEXT,            -- JSON 标量，空结果为 NULL
     computed_at  INTEGER NOT NULL,
+    status       TEXT NOT NULL DEFAULT 'open'
+                 CHECK (status IN ('open', 'sealed')),
+    sealed_at    INTEGER,
     PRIMARY KEY (sample_id, feature_name, version, feature_key)
 );
 
@@ -146,6 +151,10 @@ def connect(db_path: str | Path) -> sqlite3.Connection:
     _add_column(conn, "feature_versions", "sources", "TEXT")
     _add_column(conn, "feature_versions", "state_source", "TEXT")
     _add_column(conn, "feature_versions", "state_field", "TEXT")
+    # 兼容旧库：旧版物化结果语义上即永久冻结，迁移为已封存，保持原样。
+    _add_column(conn, "sample_features", "status",
+                "TEXT NOT NULL DEFAULT 'sealed'")
+    _add_column(conn, "sample_features", "sealed_at", "INTEGER")
     return conn
 
 

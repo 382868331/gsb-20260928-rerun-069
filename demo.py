@@ -1,4 +1,4 @@
-"""端到端演示：跨窗口 + 迟到修订不穿越 + 重复/撤回抵消 + 重启后增量=整批。
+"""端到端演示：开放/封存两态 + 封存前预览 + 可见修订按范围更新 + 重启接续。
 
 直接运行：``python demo.py``（在临时目录中创建数据库，结束即清理）。
 """
@@ -29,35 +29,55 @@ def main() -> None:
     svc.ingest("e3", "u1", event_time=500, arrival_time=510, payload={"amount": 30})
     svc.ingest("e4", "u1", event_time=900, arrival_time=9000, payload={"amount": 40})
 
-    # 3) 人工样本：as_of=1000 时冻结特征（此时 e4 还未到达）
+    # 3) 人工样本：as_of=1000 物化特征（此时 e4 还未到达），结果默认开放
     svc.register_sample("label_001", "user", "u1", as_of=1000)
-    frozen = svc.materialize("label_001", "pay")
-    print("as_of=1000 冻结:", frozen)
-    assert frozen["pay_w1000_count"] == 3
-    assert frozen["pay_w1000_sum"] == 60
+    saved = svc.materialize("label_001", "pay")
+    print("as_of=1000 物化(开放):", saved)
+    assert saved["pay_w1000_count"] == 3
+    assert saved["pay_w1000_sum"] == 60
 
     # 4) 完全重复投递被忽略
     svc.ingest("e1", "u1", event_time=100, arrival_time=100, payload={"amount": 10})
-    # 迟到修订 e1=10 -> 15、撤回 e3，都发生在 9000+，不能改变旧样本
+    # 迟到修订 e1=10 -> 15、撤回 e3，都在 9000+ 才到达，不混入 as_of=1000 的结果
     svc.ingest("e1", "u1", event_time=100, arrival_time=9100, payload={"amount": 15})
     svc.retract("e3", "u1", event_time=500, arrival_time=9200)
 
     still = svc.get_features("label_001", "pay", 1)
-    print("迟到修订/撤回后旧样本:", still)
-    assert still == frozen, "旧训练样本被穿越！"
+    print("未来才到达的修订/撤回后:", still)
+    assert still == saved, "未来才到达的信息混入了当前结果！"
 
-    # 5) 新样本（as_of=9300）按当时已知重算：e1=15, e2=20, e3已撤回, e4=40
+    # 4.5) 当时可见（arrival_time <= as_of）的撤回后来才补登到账本：
+    # 封存前先预览受影响样本、窗口与原因
+    svc.retract("e2", "u1", event_time=150, arrival_time=900)
+    preview = svc.preview_seal("label_001", "pay", 1)
+    affected = {e["feature_key"]: e for e in preview["entries"] if e["changed"]}
+    print("封存前预览(受影响范围):")
+    for key, entry in sorted(affected.items()):
+        print(f"  {key}: {entry['stored']} -> {entry['current']} 原因={entry['reasons']}")
+    assert affected["pay_w1000_count"]["current"] == 2
+    assert "retract" in affected["pay_w1000_count"]["reasons"]
+
+    # 只确认封存 pay_w1000_sum；其余范围保持开放，继续随可见修订更新
+    svc.seal("label_001", "pay", 1, feature_keys=["pay_w1000_sum"], sealed_at=9500)
+    svc.ingest("e1", "u1", event_time=100, arrival_time=950, payload={"amount": 12})
+    updated = svc.materialize("label_001", "pay")
+    print("可见修订后(封存+开放):", updated)
+    assert updated["pay_w1000_sum"] == 40    # 封存：封存时点可见结果，原样保留
+    assert updated["pay_w1000_count"] == 2   # 开放：e2 撤回已反映
+    assert updated["pay_w1000_mean"] == 21   # 开放：e1 修订为 12 后 (12+30)/2
+
+    # 5) 新样本（as_of=9300）按当时已知计算：e1=12, e2/e3 已撤回, e4=40
     svc.register_sample("label_002", "user", "u1", as_of=9300)
     svc.register_feature(
         "pay", entity="user", windows=[100, 1000, 10000],
         aggregations=["count", "sum", "mean"], value_field="amount",
         created_at=1,
-    )  # 配置变化 -> v2；v1 仍冻结
+    )  # 配置变化 -> v2；v1 的封存范围保持原样
     fresh = svc.materialize("label_002", "pay", version=2, batch=True)
     print("as_of=9300 新样本(v2):", fresh)
-    assert fresh["pay_w10000_count"] == 3
-    assert fresh["pay_w10000_sum"] == 75
-    assert svc.get_features("label_001", "pay", 1) == frozen
+    assert fresh["pay_w10000_count"] == 2
+    assert fresh["pay_w10000_sum"] == 52
+    assert svc.get_features("label_001", "pay", 1) == updated
 
     # 5.5) 多来源时间关联：历史点击 + 观测前最近有效会员状态
     svc.register_feature(
@@ -75,7 +95,7 @@ def main() -> None:
                payload={"tier": "gold"})
     svc.register_sample("profile_old", "user", "u1", as_of=9300)
     joined = svc.materialize("profile_old", "profile", version=1)
-    print("多来源 as_of=9300 冻结:", joined)
+    print("多来源 as_of=9300 物化:", joined)
     assert joined["profile_w10000_count"] == 1
     assert joined["profile_w10000_sum"] == 7
     assert joined["profile_last_state"] == "silver"
@@ -91,6 +111,11 @@ def main() -> None:
     svc2.rebuild_projection()  # 丢弃缓存整批重放
     assert svc2.compute_incremental("u1", spec, 9300) == svc2.compute_batch("u1", spec, 9300)
     print("重启后增量 == 整批，且缓存重建结果一致 ✓")
+
+    # 7) 重启接续：封存决定与历史值保留，开放范围仍随可见修订更新
+    assert svc2.seal_status("label_001", "pay", 1)["pay_w1000_sum"] == "sealed"
+    assert svc2.get_features("label_001", "pay", 1)["pay_w1000_sum"] == 40
+    print("重启后封存决定与历史值保留 ✓")
     svc2.close()
     tmp.cleanup()
 

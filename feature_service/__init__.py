@@ -3,7 +3,8 @@
 核心原则（point-in-time correctness）::
 
     查询 as_of 时点只能看到 arrival_time <= as_of 的记录；
-    迟到事件与修订不会穿越到已经冻结的旧训练样本/旧特征版本。
+    物化结果分开放/封存两态：开放结果随当时可见的修订按范围更新，
+    封存结果保持原样；未来才到达的信息任何时候都不混入。
 """
 
 from .service import FeatureService
