@@ -25,7 +25,9 @@
 - **同一业务事件**以 (entity, source, event_id) 归约：不同来源可安全复用同一 ID；同来源内取该时点可见记录的最后一条，UPSERT 贡献值，RETRACT 抵消为空。
 - **重复投递**（op/event_time/负载完全相同）在写入时幂等忽略。
 - **开放与封存**：物化结果默认开放——之后补登到账本、且当时可见（arrival_time <= as_of）的迟到资料/撤回/修订，会在下次 materialize 时按影响范围只更新仍未封存的 feature_key；封存的 feature_key 保持原值与原证据，永不改写，不能用永久冻结替代修订流程。
-- **封存流程**：先 `preview_seal` 预览受影响样本、窗口和原因（late_arrival / retract / revision / window_boundary / new_data），再用 `seal` 确认封存哪些范围；封存值取封存时点当时可见的计算结果。
+- **封存流程**：先 `preview_seal` 预览受影响样本、窗口和原因（late_arrival / retract / revision / window_boundary / new_data），再用 `seal` 确认封存哪些范围；封存值取封存时点当时可见的计算结果。一次封存可以只确认部分样本和范围，剩余部分继续开放；每次 `seal` 调用是一批确认（`seal_batches`），后续批次允许与先前范围交叠——交叠的 key 保持首次确认的值与归属批次，在新批中记为 already_sealed，不重复计入也不遗漏。
+- **归属查询**：`query_features` 逐 feature_key 说明当前值归属哪次封存确认（seal_id）、哪些部分仍可更新（updatable），以及每个值使用的账本 seq；同一条来源变动跨越多个范围时，每个范围只计入一次。
+- **修订流程**：对已封存结果用 `propose_revision` 提出修订——列出新旧值、新值采用的原始资料与受影响下游（共享同一来源记录的其它已保存结果）；`publish_revision` 发布后成为独立可查的修订视角，`reject_revision` 驳回。未采纳的修订不改变当前已确认视角，也不会提前影响依赖这些特征的研究；已封存的原始值任何情况下都不被改写。
 - **重启接续**：封存决定（status / sealed_at）、历史值与证据全部持久化，重启后保留；开放范围仍随可见资料修订。
 - **增量 = 整批**：增量投影按 checkpoint(last_seq) 只追加新账本记录（重启后续跑），与直接扫描账本整批重放走同一个纯函数 compute_from_rows。
 
@@ -52,6 +54,12 @@ svc.seal("s1", "pay", 1,
          feature_keys=["pay_w100_sum"])  # 确认封存指定范围；缺省封存全部开放范围
 svc.get_features("s1", "pay", 1)         # 读取保存值：开放=最新可见，封存=历史原样
 svc.seal_status("s1", "pay", 1)          # 每个 feature_key 的开放/封存状态
+svc.query_features("s1", "pay", 1)       # 每个值归属哪次确认、哪些仍可更新、证据 seq
+svc.seal_batches("s1", "pay", 1)         # 每次封存批次的确认/交叠明细
+
+rev = svc.propose_revision("s1", "pay", 1)   # 对已封存结果提出修订：新旧值/资料/下游
+svc.publish_revision(rev["revision_id"])     # 发布为独立修订视角（原封存值不变）
+svc.get_revision(rev["revision_id"])         # 查询已采纳修订的血缘与当时可见资料
 svc.get_evidence("s1", "pay", 1)         # 重启后仍可查看每个值来自哪些原始记录
 ```
 

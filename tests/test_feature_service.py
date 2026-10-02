@@ -343,9 +343,12 @@ class FeatureServiceTest(unittest.TestCase):
         status = s.seal_status("s1", "pay", 1)
         self.assertEqual(status["pay_w100_sum"], "sealed")
         self.assertEqual(status["pay_w100_mean"], "open")
-        # 已封存范围不能再次封存或改写
-        with self.assertRaises(ValueError):
-            s.seal("s1", "pay", 1, feature_keys=["pay_w100_sum"])
+        # 后续封存与先前范围交叠：已封存 key 保持首次确认的值与归属，
+        # 记为 already_sealed，不重复计入改写
+        again = s.seal("s1", "pay", 1, feature_keys=["pay_w100_sum"])
+        self.assertEqual(again["confirmed"], [])
+        self.assertEqual(again["already_sealed"], ["pay_w100_sum"])
+        self.assertEqual(s.get_features("s1", "pay", 1)["pay_w100_sum"], 15)
 
     def test_late_data_and_window_change_only_touch_open_visible_scope(self):
         s = self.svc
@@ -398,6 +401,107 @@ class FeatureServiceTest(unittest.TestCase):
         v = s2.materialize("s1", "pay")
         self.assertEqual(v["pay_w100_sum"], 10)   # 封存历史原样
         self.assertEqual(v["pay_w100_mean"], 30)  # 开放范围更新
+        s2.close()
+
+
+    def test_overlapping_seals_and_revision_flow_survive_restart(self):
+        s = self.svc
+        # e1/e2 同时落在 w100 与 w1000 两个范围
+        s.ingest("e1", "u1", event_time=100, arrival_time=100, payload={"amount": 10})
+        s.ingest("e2", "u1", event_time=150, arrival_time=160, payload={"amount": 20})
+        s.register_sample("s1", "user", "u1", 200)
+        v0 = s.materialize("s1", "pay")
+        self.assertEqual(v0["pay_w100_sum"], 30)
+        self.assertEqual(v0["pay_w1000_sum"], 30)
+
+        # 第一次封存只确认部分范围（w100_sum / w100_count），其余保持开放
+        batch_a = s.seal("s1", "pay", 1,
+                         feature_keys=["pay_w100_sum", "pay_w100_count"],
+                         sealed_at=1000, note="第一批")
+        self.assertEqual(sorted(batch_a["confirmed"]),
+                         ["pay_w100_count", "pay_w100_sum"])
+
+        # 当时可见的迟到材料与来源撤回：e1 修订为 15、e2 撤回、迟到 e5
+        s.ingest("e1", "u1", event_time=100, arrival_time=170, payload={"amount": 15})
+        s.retract("e2", "u1", event_time=150, arrival_time=180)
+        s.ingest("e5", "u1", event_time=120, arrival_time=190, payload={"amount": 7})
+
+        # 第二次封存与先前范围交叠：count 已封存保持原值与首批归属，
+        # mean 在本批确认（封存时点可见：e1=15, e5=7 -> mean=11）
+        batch_b = s.seal("s1", "pay", 1,
+                         feature_keys=["pay_w100_count", "pay_w100_mean"],
+                         sealed_at=2000, note="第二批")
+        self.assertEqual(batch_b["confirmed"], ["pay_w100_mean"])
+        self.assertEqual(batch_b["already_sealed"], ["pay_w100_count"])
+
+        # 开放范围（w1000_*）随可见资料更新；e5 跨两个窗口只各计一次
+        v1 = s.materialize("s1", "pay")
+        self.assertEqual(v1["pay_w100_sum"], 30)    # 首批封存：原样
+        self.assertEqual(v1["pay_w100_count"], 2)   # 首批封存：原样
+        self.assertEqual(v1["pay_w100_mean"], 11)   # 第二批封存：(15+7)/2
+        self.assertEqual(v1["pay_w1000_count"], 2)  # 开放：e2 撤回, e5 补入
+        self.assertEqual(v1["pay_w1000_sum"], 22)   # 开放：15+7
+
+        # 每次查询说明归属哪次确认、哪些部分仍可更新
+        view = s.query_features("s1", "pay", 1)
+        self.assertEqual(view["pay_w100_sum"]["seal_id"], batch_a["seal_id"])
+        self.assertEqual(view["pay_w100_count"]["seal_id"], batch_a["seal_id"])
+        self.assertEqual(view["pay_w100_mean"]["seal_id"], batch_b["seal_id"])
+        self.assertIsNone(view["pay_w1000_sum"]["seal_id"])
+        self.assertTrue(view["pay_w1000_sum"]["updatable"])
+        self.assertFalse(view["pay_w100_sum"]["updatable"])
+        # e5 的 seq 在开放范围证据中只出现一次，封存范围证据保持原记录
+        e5_seq = 5
+        self.assertEqual(view["pay_w1000_sum"]["evidence"]["behavior"].count(e5_seq), 1)
+        self.assertEqual(view["pay_w100_sum"]["evidence"]["behavior"], [1, 2])
+
+        # 对已封存结果提出修订：列出新旧值、采用资料与受影响下游
+        rev = s.propose_revision("s1", "pay", 1, note="e1 修订+e2 撤回+e5 迟到",
+                                 created_at=3000)
+        self.assertEqual(rev["status"], "proposed")
+        entries = {e["feature_key"]: e for e in rev["entries"]}
+        self.assertEqual(entries["pay_w100_sum"]["old_value"], 30)
+        self.assertEqual(entries["pay_w100_sum"]["new_value"], 22)
+        self.assertEqual(entries["pay_w100_count"]["old_value"], 2)
+        self.assertEqual(entries["pay_w100_count"]["new_value"], 2 - 1 + 1)
+        # 采用资料：新值基于当时可见的 e1 修订版与 e5
+        mat_ids = {m["event_id"] for m in entries["pay_w100_sum"]["materials"]}
+        self.assertEqual(mat_ids, {"e1", "e5"})
+        # 受影响下游：共享同一来源记录的开放范围，每个 key 只列一次
+        downstream = entries["pay_w100_sum"]["downstream"]
+        self.assertIn({"sample_id": "s1", "feature_name": "pay", "version": 1,
+                       "feature_key": "pay_w1000_sum"}, downstream)
+        self.assertEqual(len(downstream), len({d["feature_key"] for d in downstream}))
+
+        # 未采纳的修订不改变当前已确认视角
+        self.assertEqual(s.get_features("s1", "pay", 1), v1)
+        self.assertEqual(s.query_features("s1", "pay", 1)["pay_w100_sum"]["value"], 30)
+
+        # 发布独立修订；再提一份并驳回，两者都不改写已封存值
+        published = s.publish_revision(rev["revision_id"], published_at=4000)
+        self.assertEqual(published["status"], "published")
+        rev2 = s.propose_revision("s1", "pay", 1, created_at=4100)
+        s.reject_revision(rev2["revision_id"])
+        self.assertEqual(s.get_features("s1", "pay", 1), v1)
+
+        # 保存重开：原封存、已采纳修订、仍开放范围各自血缘与当时可见资料一致
+        s.close()
+        s2 = FeatureService(self.db)
+        view2 = s2.query_features("s1", "pay", 1)
+        self.assertEqual(view2, view)
+        batches = s2.seal_batches("s1", "pay", 1)
+        self.assertEqual([b["note"] for b in batches], ["第一批", "第二批"])
+        self.assertEqual(batches[1]["already_sealed"], ["pay_w100_count"])
+        got_rev = s2.get_revision(rev["revision_id"])
+        self.assertEqual(got_rev["status"], "published")
+        self.assertEqual(got_rev["entries"], published["entries"])
+        self.assertEqual(
+            s2.list_revisions("s1", status="rejected")[0]["revision_id"],
+            rev2["revision_id"],
+        )
+        # 开放范围重算仍只反映当时可见资料；封存与修订视角不变
+        self.assertEqual(s2.materialize("s1", "pay"), v1)
+        self.assertEqual(s2.get_features("s1", "pay", 1), v1)
         s2.close()
 
 

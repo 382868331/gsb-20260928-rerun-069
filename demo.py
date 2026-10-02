@@ -116,7 +116,43 @@ def main() -> None:
     assert svc2.seal_status("label_001", "pay", 1)["pay_w1000_sum"] == "sealed"
     assert svc2.get_features("label_001", "pay", 1)["pay_w1000_sum"] == 40
     print("重启后封存决定与历史值保留 ✓")
+
+    # 8) 部分交叠封存：第二批与第一批范围交叠，交叠 key 保持首次归属
+    svc2.seal("label_001", "pay", 1, feature_keys=["pay_w1000_count"], sealed_at=9600)
+    overlap = svc2.seal(
+        "label_001", "pay", 1,
+        feature_keys=["pay_w1000_count", "pay_w1000_mean"], sealed_at=9700,
+    )
+    assert overlap["confirmed"] == ["pay_w1000_mean"]
+    assert overlap["already_sealed"] == ["pay_w1000_count"]
+    view = svc2.query_features("label_001", "pay", 1)
+    batches = svc2.seal_batches("label_001", "pay", 1)
+    by_id = {b["seal_id"]: b for b in batches}
+    assert view["pay_w1000_count"]["seal_id"] != view["pay_w1000_mean"]["seal_id"]
+    assert not view["pay_w100_count"]["seal_id"]  # 仍开放，可继续更新
+    assert view["pay_w100_count"]["updatable"]
+    print("部分交叠封存：每批归属清晰，交叠不重复计入 ✓")
+
+    # 9) 修订流程：对已封存结果提出修订 -> 发布独立修订视角
+    svc2.ingest("e1", "u1", event_time=100, arrival_time=980, payload={"amount": 99})
+    rev = svc2.propose_revision("label_001", "pay", 1, note="e1 再次修订")
+    entries = {e["feature_key"]: e for e in rev["entries"]}
+    print("修订对照:", {k: (e["old_value"], e["new_value"]) for k, e in entries.items()})
+    assert entries["pay_w1000_sum"]["old_value"] == 40
+    assert entries["pay_w1000_sum"]["new_value"] == 99 + 30  # e1 修订为 99，e3 仍在窗内
+    assert svc2.get_features("label_001", "pay", 1)["pay_w1000_sum"] == 40  # 未采纳不影响
+    svc2.publish_revision(rev["revision_id"], published_at=9800)
     svc2.close()
+
+    # 10) 保存重开：原封存、已采纳修订、仍开放范围各自血缘一致
+    svc3 = FeatureService(db)
+    assert svc3.query_features("label_001", "pay", 1) == view
+    got_rev = svc3.get_revision(rev["revision_id"])
+    assert got_rev["status"] == "published"
+    assert {m["event_id"] for e in got_rev["entries"] for m in e["materials"]} >= {"e1"}
+    assert svc3.get_features("label_001", "pay", 1)["pay_w1000_sum"] == 40
+    print("重启后：原封存/已采纳修订/开放范围血缘各自一致 ✓")
+    svc3.close()
     tmp.cleanup()
 
 

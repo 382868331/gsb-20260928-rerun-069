@@ -237,12 +237,17 @@ class FeatureService:
         self, sample_id: str, feature_name: str, version: int
     ) -> dict[str, dict[str, object]]:
         rows = self.conn.execute(
-            "SELECT feature_key, value, status FROM sample_features "
+            "SELECT feature_key, value, status, sealed_at, seal_id FROM sample_features "
             "WHERE sample_id = ? AND feature_name = ? AND version = ?",
             (sample_id, feature_name, version),
         ).fetchall()
         return {
-            r["feature_key"]: {"value": loads(r["value"]), "status": r["status"]}
+            r["feature_key"]: {
+                "value": loads(r["value"]),
+                "status": r["status"],
+                "sealed_at": r["sealed_at"],
+                "seal_id": r["seal_id"],
+            }
             for r in rows
         }
 
@@ -255,6 +260,7 @@ class FeatureService:
         only_keys: set[str] | None = None,
         seal: bool = False,
         sealed_at: int | None = None,
+        seal_id: int | None = None,
     ) -> None:
         """把计算结果写入开放范围；已封存的 feature_key 永不改写。"""
         version = spec.version
@@ -274,14 +280,15 @@ class FeatureService:
         self.conn.executemany(
             "INSERT INTO sample_features "
             "(sample_id, feature_name, version, feature_key, value, computed_at, "
-            "status, sealed_at) "
-            "VALUES (?,?,?,?,?,?,?,?) "
+            "status, sealed_at, seal_id) "
+            "VALUES (?,?,?,?,?,?,?,?,?) "
             "ON CONFLICT(sample_id, feature_name, version, feature_key) "
             "DO UPDATE SET value = excluded.value, computed_at = excluded.computed_at, "
-            "status = excluded.status, sealed_at = excluded.sealed_at",
+            "status = excluded.status, sealed_at = excluded.sealed_at, "
+            "seal_id = excluded.seal_id",
             [
                 (sample_id, spec.name, version, key, dumps(value), now,
-                 status, sealed_at if seal else None)
+                 status, sealed_at if seal else None, seal_id if seal else None)
                 for key, value in targets
             ],
         )
@@ -463,14 +470,17 @@ class FeatureService:
         *,
         batch: bool = False,
         sealed_at: int | None = None,
-    ) -> list[str]:
-        """确认封存：把指定的开放 feature_key 冻结为当前可见结果。
+        note: str | None = None,
+    ) -> dict[str, object]:
+        """确认封存：一次调用是一批确认，可以只确认部分范围。
 
         * feature_keys=None 封存全部仍开放的范围；
         * 封存值取封存时点当时可见（arrival_time <= as_of）的计算结果，
           与 preview_seal 展示的 current 一致；
-        * 已封存的 key 再次指定会报错，封存历史永不改写；
-        * 封存决定与历史值持久化，重启接续后仍然有效。
+        * 后续批次允许与先前范围交叠：已封存的 key 保持首次确认的值与
+          归属批次，在本批中记为 already_sealed，不重复计入也不改写；
+        * 每批决定（含交叠明细）与历史值持久化，重启接续后仍然有效；
+        * 返回 {seal_id, confirmed, already_sealed}。
         """
         sample = self._sample(sample_id)
         spec = self._get_spec(feature_name, version)
@@ -483,25 +493,338 @@ class FeatureService:
         open_keys = {k for k, r in stored.items() if r["status"] == OPEN}
         sealed_keys = {k for k, r in stored.items() if r["status"] == SEALED}
         if feature_keys is None:
-            targets = sorted(open_keys)
+            requested = sorted(open_keys)
         else:
-            targets = []
+            requested = []
             for key in feature_keys:
-                if key in sealed_keys:
-                    raise ValueError(f"{key!r} 已封存，封存历史不能改写")
-                if key not in open_keys:
-                    raise KeyError(f"{key!r} 不是仍开放的 feature_key")
-                targets.append(key)
-        if not targets:
-            return []
-        explained = self._explain(sample, spec, batch)
+                if key not in open_keys and key not in sealed_keys:
+                    raise KeyError(f"{key!r} 不是已物化的 feature_key")
+                requested.append(key)
+        confirmed = sorted(k for k in requested if k in open_keys)
+        already = sorted(k for k in requested if k in sealed_keys)
+        if not requested:
+            return {"seal_id": None, "confirmed": [], "already_sealed": []}
         if sealed_at is None:
             sealed_at = int(time.time() * 1000)
-        self._store_results(
-            sample_id, spec, explained,
-            only_keys=set(targets), seal=True, sealed_at=sealed_at,
+        cur = self.conn.execute(
+            "INSERT INTO seal_batches (sample_id, feature_name, version, sealed_at, note) "
+            "VALUES (?,?,?,?,?)",
+            (sample_id, feature_name, version, sealed_at, note),
         )
-        return sorted(targets)
+        seal_id = cur.lastrowid
+        self.conn.executemany(
+            "INSERT INTO seal_batch_keys (seal_id, feature_key, outcome) VALUES (?,?,?)",
+            [(seal_id, key, "confirmed") for key in confirmed]
+            + [(seal_id, key, "already_sealed") for key in already],
+        )
+        self.conn.commit()
+        if confirmed:
+            explained = self._explain(sample, spec, batch)
+            self._store_results(
+                sample_id, spec, explained,
+                only_keys=set(confirmed), seal=True, sealed_at=sealed_at,
+                seal_id=seal_id,
+            )
+        return {"seal_id": seal_id, "confirmed": confirmed, "already_sealed": already}
+
+    def seal_batches(
+        self, sample_id: str, feature_name: str, version: int
+    ) -> list[dict[str, object]]:
+        """列出某样本某特征版本的全部封存批次及每批确认/交叠明细。"""
+        batches = []
+        for row in self.conn.execute(
+            "SELECT seal_id, sealed_at, note FROM seal_batches "
+            "WHERE sample_id = ? AND feature_name = ? AND version = ? "
+            "ORDER BY seal_id",
+            (sample_id, feature_name, version),
+        ).fetchall():
+            keys = self.conn.execute(
+                "SELECT feature_key, outcome FROM seal_batch_keys "
+                "WHERE seal_id = ? ORDER BY feature_key",
+                (row["seal_id"],),
+            ).fetchall()
+            batches.append({
+                "seal_id": row["seal_id"],
+                "sealed_at": row["sealed_at"],
+                "note": row["note"],
+                "confirmed": [k["feature_key"] for k in keys if k["outcome"] == "confirmed"],
+                "already_sealed": [
+                    k["feature_key"] for k in keys if k["outcome"] == "already_sealed"
+                ],
+            })
+        return batches
+
+    def query_features(
+        self, sample_id: str, feature_name: str, version: int
+    ) -> dict[str, dict[str, object]]:
+        """逐 feature_key 说明当前结果：值、归属哪次封存确认、仍可更新部分。
+
+        每个 key 返回 value / status / seal_id（归属的封存批次，开放为
+        None）/ sealed_at / updatable（是否仍随可见资料更新）/ evidence
+        （该值使用的账本 seq，按角色分组）。
+        """
+        stored = self._stored_rows(sample_id, feature_name, version)
+        if not stored:
+            raise KeyError(
+                f"样本 {sample_id!r} 尚未物化 {feature_name!r} v{version}"
+            )
+        evidence: dict[str, dict[str, list[int]]] = {
+            key: {"behavior": [], "state": []} for key in stored
+        }
+        for row in self.conn.execute(
+            "SELECT feature_key, seq, role FROM sample_feature_evidence "
+            "WHERE sample_id = ? AND feature_name = ? AND version = ? "
+            "ORDER BY feature_key, role, seq",
+            (sample_id, feature_name, version),
+        ).fetchall():
+            evidence[row["feature_key"]][row["role"]].append(row["seq"])
+        return {
+            key: {
+                "value": row["value"],
+                "status": row["status"],
+                "seal_id": row["seal_id"],
+                "sealed_at": row["sealed_at"],
+                "updatable": row["status"] == OPEN,
+                "evidence": evidence[key],
+            }
+            for key, row in sorted(stored.items())
+        }
+
+    # ---- 修订流程：先提出对照，再决定是否发布独立修订 -------------------
+
+    def _evidence_records(self, seqs: list[int]) -> dict[int, dict[str, object]]:
+        if not seqs:
+            return {}
+        return {
+            r["seq"]: {**dict(r), "payload": loads(r["payload"])}
+            for r in self.conn.execute(
+                "SELECT seq, event_id, entity, source, op, event_time, arrival_time, payload "
+                "FROM event_log WHERE seq IN (%s) ORDER BY seq"
+                % ",".join("?" for _ in seqs),
+                list(seqs),
+            ).fetchall()
+        }
+
+    def _stored_evidence(
+        self, sample_id: str, feature_name: str, version: int
+    ) -> dict[str, dict[str, list[int]]]:
+        evidence: dict[str, dict[str, list[int]]] = {}
+        for row in self.conn.execute(
+            "SELECT feature_key, seq, role FROM sample_feature_evidence "
+            "WHERE sample_id = ? AND feature_name = ? AND version = ? "
+            "ORDER BY feature_key, role, seq",
+            (sample_id, feature_name, version),
+        ).fetchall():
+            evidence.setdefault(row["feature_key"], {"behavior": [], "state": []})[
+                row["role"]
+            ].append(row["seq"])
+        return evidence
+
+    def _downstream_of(
+        self,
+        changed_seqs: set[int],
+        *,
+        exclude: set[tuple[str, str, int, str]],
+    ) -> list[dict[str, object]]:
+        """找出证据用到这些账本记录的其它已保存结果（受影响下游）。
+
+        同一条来源变动跨越多个范围时，每个下游 key 只计一次；修订对象
+        自身（exclude）不计入。
+        """
+        if not changed_seqs:
+            return []
+        rows = self.conn.execute(
+            "SELECT DISTINCT sample_id, feature_name, version, feature_key "
+            "FROM sample_feature_evidence WHERE seq IN (%s) "
+            "ORDER BY sample_id, feature_name, version, feature_key"
+            % ",".join("?" for _ in changed_seqs),
+            sorted(changed_seqs),
+        ).fetchall()
+        return [
+            {
+                "sample_id": r["sample_id"],
+                "feature_name": r["feature_name"],
+                "version": r["version"],
+                "feature_key": r["feature_key"],
+            }
+            for r in rows
+            if (r["sample_id"], r["feature_name"], r["version"], r["feature_key"])
+            not in exclude
+        ]
+
+    def propose_revision(
+        self,
+        sample_id: str,
+        feature_name: str,
+        version: int | None = None,
+        *,
+        note: str | None = None,
+        batch: bool = False,
+        created_at: int | None = None,
+    ) -> dict[str, object]:
+        """对已封存结果提出修订：列出新旧值、采用资料与受影响下游。
+
+        只生成一份 proposed 状态的修订单，不改写任何已保存值；未采纳前
+        当前已确认视角与依赖这些特征的研究完全不受影响。
+        """
+        sample = self._sample(sample_id)
+        spec = self._get_spec(feature_name, version)
+        version = spec.version
+        stored = self._stored_rows(sample_id, feature_name, version)
+        sealed_keys = sorted(k for k, r in stored.items() if r["status"] == SEALED)
+        if not sealed_keys:
+            raise ValueError(
+                f"样本 {sample_id!r} 的 {feature_name!r} v{version} 没有已封存结果可修订"
+            )
+        explained = self._explain(sample, spec, batch)
+        current_values: dict[str, object] = explained["values"]
+        current_evidence: dict[str, dict[str, list[int]]] = explained["evidence"]
+        old_evidence = self._stored_evidence(sample_id, feature_name, version)
+
+        entries = []
+        for key in sealed_keys:
+            old_value = stored[key]["value"]
+            new_value = current_values.get(key)
+            if old_value == new_value and old_evidence.get(key) == current_evidence.get(key):
+                continue
+            new_seqs = current_evidence.get(key, {"behavior": [], "state": []})
+            old_seqs = old_evidence.get(key, {"behavior": [], "state": []})
+            changed_seqs = {
+                seq
+                for role in ("behavior", "state")
+                for seq in set(new_seqs[role]) ^ set(old_seqs[role])
+            }
+            downstream = self._downstream_of(
+                changed_seqs,
+                exclude={(sample_id, feature_name, version, key)},
+            )
+            entries.append({
+                "feature_key": key,
+                "old_value": old_value,
+                "new_value": new_value,
+                "evidence": new_seqs,
+                "downstream": downstream,
+            })
+        if created_at is None:
+            created_at = int(time.time() * 1000)
+        cur = self.conn.execute(
+            "INSERT INTO revisions "
+            "(sample_id, feature_name, version, status, note, created_at) "
+            "VALUES (?,?,?,?,?,?)",
+            (sample_id, feature_name, version, "proposed", note, created_at),
+        )
+        revision_id = cur.lastrowid
+        self.conn.executemany(
+            "INSERT INTO revision_entries "
+            "(revision_id, feature_key, old_value, new_value, evidence, downstream) "
+            "VALUES (?,?,?,?,?,?)",
+            [
+                (revision_id, e["feature_key"], dumps(e["old_value"]),
+                 dumps(e["new_value"]), dumps(e["evidence"]), dumps(e["downstream"]))
+                for e in entries
+            ],
+        )
+        self.conn.commit()
+        return self.get_revision(revision_id)
+
+    def _revision_row(self, revision_id: int):
+        row = self.conn.execute(
+            "SELECT revision_id, sample_id, feature_name, version, status, note, "
+            "created_at, published_at FROM revisions WHERE revision_id = ?",
+            (revision_id,),
+        ).fetchone()
+        if row is None:
+            raise KeyError(f"修订不存在: {revision_id}")
+        return row
+
+    def get_revision(self, revision_id: int) -> dict[str, object]:
+        """读取修订单：新旧值对照、新值采用的原始资料、受影响下游。"""
+        row = self._revision_row(revision_id)
+        entries = []
+        for e in self.conn.execute(
+            "SELECT feature_key, old_value, new_value, evidence, downstream "
+            "FROM revision_entries WHERE revision_id = ? ORDER BY feature_key",
+            (revision_id,),
+        ).fetchall():
+            evidence = loads(e["evidence"])
+            seqs = sorted({s for role_seqs in evidence.values() for s in role_seqs})
+            entries.append({
+                "feature_key": e["feature_key"],
+                "old_value": loads(e["old_value"]),
+                "new_value": loads(e["new_value"]),
+                "evidence": evidence,
+                "materials": list(self._evidence_records(seqs).values()),
+                "downstream": loads(e["downstream"]),
+            })
+        return {
+            "revision_id": row["revision_id"],
+            "sample_id": row["sample_id"],
+            "feature_name": row["feature_name"],
+            "version": row["version"],
+            "status": row["status"],
+            "note": row["note"],
+            "created_at": row["created_at"],
+            "published_at": row["published_at"],
+            "entries": entries,
+        }
+
+    def list_revisions(
+        self,
+        sample_id: str | None = None,
+        feature_name: str | None = None,
+        version: int | None = None,
+        *,
+        status: str | None = None,
+    ) -> list[dict[str, object]]:
+        """按样本/特征/状态过滤修订单（不含条目明细）。"""
+        sql = (
+            "SELECT revision_id, sample_id, feature_name, version, status, note, "
+            "created_at, published_at FROM revisions WHERE 1=1"
+        )
+        params: list[object] = []
+        if sample_id is not None:
+            sql += " AND sample_id = ?"
+            params.append(sample_id)
+        if feature_name is not None:
+            sql += " AND feature_name = ?"
+            params.append(feature_name)
+        if version is not None:
+            sql += " AND version = ?"
+            params.append(version)
+        if status is not None:
+            sql += " AND status = ?"
+            params.append(status)
+        sql += " ORDER BY revision_id"
+        return [dict(r) for r in self.conn.execute(sql, params).fetchall()]
+
+    def publish_revision(
+        self, revision_id: int, *, published_at: int | None = None
+    ) -> dict[str, object]:
+        """发布修订：成为独立可查的修订视角，已封存的原始值保持原样。"""
+        row = self._revision_row(revision_id)
+        if row["status"] != "proposed":
+            raise ValueError(f"修订 {revision_id} 当前为 {row['status']}，不能发布")
+        if published_at is None:
+            published_at = int(time.time() * 1000)
+        self.conn.execute(
+            "UPDATE revisions SET status = 'published', published_at = ? "
+            "WHERE revision_id = ?",
+            (published_at, revision_id),
+        )
+        self.conn.commit()
+        return self.get_revision(revision_id)
+
+    def reject_revision(self, revision_id: int) -> dict[str, object]:
+        """不采纳修订：标记为 rejected，不改变任何当前视角。"""
+        row = self._revision_row(revision_id)
+        if row["status"] != "proposed":
+            raise ValueError(f"修订 {revision_id} 当前为 {row['status']}，不能驳回")
+        self.conn.execute(
+            "UPDATE revisions SET status = 'rejected' WHERE revision_id = ?",
+            (revision_id,),
+        )
+        self.conn.commit()
+        return self.get_revision(revision_id)
 
     def seal_status(
         self, sample_id: str, feature_name: str, version: int

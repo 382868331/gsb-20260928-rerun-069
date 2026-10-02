@@ -86,6 +86,48 @@ CREATE TABLE IF NOT EXISTS sample_feature_evidence (
     role         TEXT NOT NULL CHECK (role IN ('behavior', 'state')),
     PRIMARY KEY (sample_id, feature_name, version, feature_key, role, seq)
 );
+
+-- 每次封存确认是一批：一次封存可以只确认部分范围，后续批次允许与先前
+-- 范围交叠；交叠的 key 保持首次确认的归属，批次里记为 already_sealed。
+CREATE TABLE IF NOT EXISTS seal_batches (
+    seal_id      INTEGER PRIMARY KEY AUTOINCREMENT,
+    sample_id    TEXT NOT NULL,
+    feature_name TEXT NOT NULL,
+    version      INTEGER NOT NULL,
+    sealed_at    INTEGER NOT NULL,
+    note         TEXT
+);
+
+CREATE TABLE IF NOT EXISTS seal_batch_keys (
+    seal_id     INTEGER NOT NULL,
+    feature_key TEXT NOT NULL,
+    outcome     TEXT NOT NULL CHECK (outcome IN ('confirmed', 'already_sealed')),
+    PRIMARY KEY (seal_id, feature_key)
+);
+
+-- 对已封存结果的修订：先提出（proposed），列出新旧值、采用资料与受影响
+-- 下游；发布（published）后是独立修订视图，不改写已封存值；未采纳
+-- （proposed/rejected）不影响任何当前视角。
+CREATE TABLE IF NOT EXISTS revisions (
+    revision_id  INTEGER PRIMARY KEY AUTOINCREMENT,
+    sample_id    TEXT NOT NULL,
+    feature_name TEXT NOT NULL,
+    version      INTEGER NOT NULL,
+    status       TEXT NOT NULL CHECK (status IN ('proposed', 'published', 'rejected')),
+    note         TEXT,
+    created_at   INTEGER NOT NULL,
+    published_at INTEGER
+);
+
+CREATE TABLE IF NOT EXISTS revision_entries (
+    revision_id INTEGER NOT NULL,
+    feature_key TEXT NOT NULL,
+    old_value   TEXT,
+    new_value   TEXT,
+    evidence    TEXT NOT NULL,   -- JSON {role: [seq]}，新值采用的账本记录
+    downstream  TEXT NOT NULL,   -- JSON list[{sample_id, feature_name, version, feature_key}]
+    PRIMARY KEY (revision_id, feature_key)
+);
 """
 
 
@@ -155,6 +197,8 @@ def connect(db_path: str | Path) -> sqlite3.Connection:
     _add_column(conn, "sample_features", "status",
                 "TEXT NOT NULL DEFAULT 'sealed'")
     _add_column(conn, "sample_features", "sealed_at", "INTEGER")
+    # 兼容旧库：归属哪次封存确认；历史封存行为 NULL（未知批次）。
+    _add_column(conn, "sample_features", "seal_id", "INTEGER")
     return conn
 
 
