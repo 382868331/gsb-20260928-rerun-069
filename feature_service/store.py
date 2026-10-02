@@ -86,6 +86,63 @@ CREATE TABLE IF NOT EXISTS sample_feature_evidence (
     role         TEXT NOT NULL CHECK (role IN ('behavior', 'state')),
     PRIMARY KEY (sample_id, feature_name, version, feature_key, role, seq)
 );
+
+CREATE TABLE IF NOT EXISTS confirmations (
+    confirmation_id TEXT PRIMARY KEY,
+    feature_name    TEXT NOT NULL,
+    version         INTEGER NOT NULL,
+    confirmed_at    INTEGER NOT NULL,
+    scope           TEXT NOT NULL,
+    note            TEXT
+);
+
+CREATE TABLE IF NOT EXISTS confirmation_items (
+    sample_id       TEXT NOT NULL,
+    feature_name    TEXT NOT NULL,
+    version         INTEGER NOT NULL,
+    feature_key     TEXT NOT NULL,
+    confirmation_id TEXT NOT NULL,
+    range_start     INTEGER,
+    range_end       INTEGER NOT NULL,
+    evidence       TEXT NOT NULL DEFAULT '{}',
+    PRIMARY KEY (sample_id, feature_name, version, feature_key,
+                 range_start, range_end, confirmation_id)
+);
+
+CREATE TABLE IF NOT EXISTS revision_proposals (
+    proposal_id     TEXT PRIMARY KEY,
+    feature_name    TEXT NOT NULL,
+    version         INTEGER NOT NULL,
+    status          TEXT NOT NULL
+                    CHECK (status IN ('proposed', 'rejected', 'published')),
+    proposed_at     INTEGER NOT NULL,
+    decided_at      INTEGER,
+    downstream      TEXT NOT NULL,
+    note            TEXT
+);
+
+CREATE TABLE IF NOT EXISTS revision_items (
+    proposal_id  TEXT NOT NULL,
+    sample_id    TEXT NOT NULL,
+    feature_name TEXT NOT NULL,
+    version      INTEGER NOT NULL,
+    feature_key  TEXT NOT NULL,
+    old_value    TEXT,
+    new_value    TEXT,
+    PRIMARY KEY (proposal_id, sample_id, feature_name, version, feature_key)
+);
+
+CREATE TABLE IF NOT EXISTS revision_evidence (
+    proposal_id  TEXT NOT NULL,
+    sample_id    TEXT NOT NULL,
+    feature_name TEXT NOT NULL,
+    version      INTEGER NOT NULL,
+    feature_key  TEXT NOT NULL,
+    seq          INTEGER NOT NULL,
+    role         TEXT NOT NULL CHECK (role IN ('behavior', 'state')),
+    PRIMARY KEY (proposal_id, sample_id, feature_name, version,
+                 feature_key, role, seq)
+);
 """
 
 
@@ -155,6 +212,34 @@ def connect(db_path: str | Path) -> sqlite3.Connection:
     _add_column(conn, "sample_features", "status",
                 "TEXT NOT NULL DEFAULT 'sealed'")
     _add_column(conn, "sample_features", "sealed_at", "INTEGER")
+    _add_column(conn, "sample_features", "confirmation_id", "TEXT")
+    _add_column(conn, "confirmation_items", "evidence", "TEXT NOT NULL DEFAULT '{}'")
+    conn.execute(
+        "UPDATE sample_features SET confirmation_id = 'confirmation-1' "
+        "WHERE status = 'sealed' AND confirmation_id IS NULL"
+    )
+    conn.execute(
+        "INSERT OR IGNORE INTO confirmations "
+        "(confirmation_id, feature_name, version, confirmed_at, scope, note) "
+        "SELECT 'confirmation-1', feature_name, version, "
+        "COALESCE(MAX(sealed_at), 0), '[]', 'migrated-sealed-results' "
+        "FROM sample_features WHERE status = 'sealed' "
+        "GROUP BY feature_name, version"
+    )
+    conn.execute(
+        "INSERT OR IGNORE INTO confirmation_items "
+        "(sample_id, feature_name, version, feature_key, confirmation_id, "
+        "range_start, range_end) "
+        "SELECT sample_id, feature_name, version, feature_key, "
+        "confirmation_id, NULL, 0 FROM sample_features "
+        "WHERE status = 'sealed' AND confirmation_id IS NOT NULL "
+        "AND NOT EXISTS ("
+        "SELECT 1 FROM confirmation_items ci WHERE ci.sample_id = sample_features.sample_id "
+        "AND ci.feature_name = sample_features.feature_name "
+        "AND ci.version = sample_features.version "
+        "AND ci.feature_key = sample_features.feature_key)"
+    )
+    conn.commit()
     return conn
 
 

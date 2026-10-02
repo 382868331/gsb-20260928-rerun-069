@@ -400,6 +400,112 @@ class FeatureServiceTest(unittest.TestCase):
         self.assertEqual(v["pay_w100_mean"], 30)  # 开放范围更新
         s2.close()
 
+    def test_partial_overlapping_confirmations_revision_and_restart(self):
+        s = self.svc
+        s.ingest("e1", "u1", event_time=100, arrival_time=100, payload={"amount": 10})
+        s.ingest("e2", "u1", event_time=300, arrival_time=300, payload={"amount": 20})
+        s.register_sample("s1", "user", "u1", 1000)
+        s.register_sample("s2", "user", "u1", 1000)
+        s.materialize("s1", "pay")
+        s.materialize("s2", "pay")
+
+        self.assertEqual(
+            s.confirm_scope(
+                "pay", ["s1"], time_ranges=[(100, 250)],
+                confirmation_id="c1", confirmed_at=500,
+            )["confirmation_id"],
+            "c1",
+        )
+        s.seal("s2", "pay", 1, confirmation_id="c3", sealed_at=400)
+
+        # e2 在第一次确认后、第二次确认前撤回；第二次确认固定撤回后的视角。
+        s.retract("e2", "u1", event_time=300, arrival_time=550)
+        self.assertEqual(
+            s.confirm_scope(
+                "pay", ["s1"], time_ranges=[(200, 600)],
+                confirmation_id="c2", confirmed_at=600,
+            )["confirmation_id"],
+            "c2",
+        )
+        # 迟到资料只进入仍开放区间。交叠区间归属较新确认，但同一来源不重复计入。
+        s.ingest("late", "u1", event_time=700, arrival_time=900,
+                 payload={"amount": 30})
+        s.materialize("s1", "pay")
+        partial = s.get_results("s1", "pay", 1)
+        self.assertEqual(partial["pay_w1000_count"]["value"], 2)
+        self.assertEqual(partial["pay_w1000_sum"]["value"], 40.0)
+        self.assertEqual(
+            partial["pay_w1000_sum"]["confirmed_ranges"],
+            [
+                {"start": 100, "end": 200, "confirmation_id": "c1"},
+                {"start": 200, "end": 600, "confirmation_id": "c2"},
+            ],
+        )
+        self.assertEqual(
+            partial["pay_w1000_sum"]["open_ranges"],
+            [[0, 100], [600, 1000]],
+        )
+
+        proposal = s.propose_revision(
+            "r1", "pay", [("s2", "pay_w1000_sum")], ["downstream-study"],
+            proposed_at=960,
+        )
+        self.assertEqual(proposal["items"][0]["old_value"], 30.0)
+        self.assertEqual(proposal["items"][0]["new_value"], 40.0)
+        self.assertEqual(proposal["downstream"], ["downstream-study"])
+        self.assertIsNone(
+            s.get_results("s2", "pay", 1)["pay_w1000_sum"]["revision_id"]
+        )
+        self.assertEqual(s.decide_revision("r1", publish=True, decided_at=970), "published")
+        current = s.get_results("s2", "pay", 1)["pay_w1000_sum"]
+        self.assertEqual(current["value"], 40.0)
+        self.assertEqual(current["revision_id"], "r1")
+        self.assertEqual(current["confirmation_id"], "c3")
+        original = s.get_results("s2", "pay", 1, view="original")["pay_w1000_sum"]
+        self.assertEqual(original["value"], 30.0)
+        self.assertIsNone(original["revision_id"])
+
+        rejected = s.propose_revision(
+            "r2", "pay", [("s2", "pay_w1000_count")], [], proposed_at=980,
+        )
+        self.assertEqual(s.decide_revision("r2", publish=False, decided_at=990), "rejected")
+        self.assertEqual(
+            s.get_results("s2", "pay", 1)["pay_w1000_count"]["value"], 2
+        )
+
+        original_evidence = s.get_confirmation_evidence(
+            "c3", include_records=False
+        )
+        revision_evidence = s.get_revision_evidence("r1", include_records=False)
+        open_evidence = s.get_result_evidence(
+            "s1", "pay", 1, include_records=False
+        )
+        self.assertEqual(original_evidence["pay_w1000_sum"]["behavior"], [1, 2])
+        self.assertEqual(revision_evidence["pay_w1000_sum"]["behavior"], [1, 4])
+        self.assertEqual(open_evidence["pay_w1000_sum"]["behavior"], [1, 4])
+
+        s.close()
+        reopened = FeatureService(self.db)
+        self.assertEqual(
+            reopened.get_results("s1", "pay", 1)["pay_w1000_sum"]["value"], 40.0
+        )
+        self.assertEqual(
+            reopened.get_results("s2", "pay", 1, view="original")["pay_w1000_sum"]["value"],
+            30.0,
+        )
+        self.assertEqual(
+            reopened.get_revision("r1")["status"], "published"
+        )
+        self.assertEqual(
+            reopened.get_confirmation_evidence("c3", include_records=False),
+            original_evidence,
+        )
+        self.assertEqual(
+            reopened.get_revision_evidence("r1", include_records=False),
+            revision_evidence,
+        )
+        reopened.close()
+
 
 if __name__ == "__main__":
     unittest.main()
