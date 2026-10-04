@@ -102,9 +102,60 @@ register_aggregation(StdDev())
 
 内置：count、sum、mean、min、max。
 
+
+## 固定研究数据集（逐样本视角 · 冻结 · 更新分类）
+
+`ResearchDatasetService` 在特征服务之上组装一份**固定研究数据集**：
+
+- **逐样本观察时刻**：每个样本按自己的 `as_of` 取当时可见资料，不统一取最新值。
+- **逐值血缘**：每个值标明来自某次封存（`sealed` + `seal_id`）或显式采用的已发布
+  修订（`revision` + `revision_id`），并保留各自定义下的证据 seq。
+- **缺失区分**：`unconfirmed`（有可见值但范围仍开放、尚未确认）、
+  `no_evidence`（根本没有可用证据）、`time_limit`（受观察时刻限制，如特征定义
+  在 `as_of` 之后才存在）。
+- **预览再冻结**：`preview_dataset` 先列出完整/不完整样本及每格来源，
+  `freeze_dataset` 只冻结完整样本（值与血缘复制成快照）。
+- **旧集稳定**：冻结后迟到的早期资料、历史特征修订都不自动进入旧数据集。
+- **更新分类**：`propose_update` 把差异分为 `sample_scope`（样本范围）、
+  `revision`（特征修订，需显式采用）、`visible_selection`（同一封存视角下当时
+  可见资料的选择变化，尚无修订可采用，仅保留提示）。`adopt_update` 落到一个新的
+  frozen 数据集，**未采用的差异原样保留**在新集的待办中。
+- **身份计数**：`coverage` 的样本覆盖按样本身份计数；独立来源证据按来源事件身份
+  `(entity, source, event_id)` 计数——同一来源事件合法参与多个特征只计一次，
+  一个样本的多个特征也不增加样本数。
+- **不使用未来资料**：写入冻结格时校验每个证据 `arrival_time <= as_of`，
+  违反即报错，避免某格用了未来资料却把整行标成当时可用。
+- **重开一致**：冻结值与血缘全部持久化，重开后 `read_row`/`lineage`/`coverage`
+  与冻结时逐项一致。
+
+```python
+from feature_service import FeatureService, ResearchDatasetService
+
+svc = FeatureService("data.db")
+ds = ResearchDatasetService(svc)
+
+did = ds.create_dataset("study-1", created_at=1200)
+ds.add_feature_view(did, "pay", 1)            # 采用特征版本
+ds.add_samples(did, ["s1", "s2", "s3"])
+preview = ds.preview_dataset(did)            # 完整/不完整样本 + 每格原因
+ds.freeze_dataset(did, frozen_at=1200)       # 只冻结完整样本
+ds.read_row(did, "s1")                       # 逐项冻结值 {feature:version:key: value}
+ds.lineage(did, "s1")                        # 每格 sealed/revision 来源与证据记录
+ds.coverage(did)                             # sample_count / source_event_count
+
+proposal = ds.propose_update(did)            # 三类变化，不改写数据
+new_id = ds.adopt_update(                    # 只采用选中的 revision/sample_scope
+    did, [["s1", "pay", 1, "pay_w1000_sum"]],
+    name="study-1-r1", frozen_at=1400)
+ds.pending_diffs(new_id)                     # 仍未采用的差异被保留
+```
+
+校验：`python -m unittest discover -s tests -v`；演示：`python demo_dataset.py`。
+
 ## 校验
 
 ```bash
 python -m unittest discover -s tests -v   # 跨窗口 / 迟到 / 多来源 / 边界 / 撤回 / 开放封存 / 证据重启
-python demo.py                            # 端到端演示
+python demo.py                            # 特征服务端到端演示
+python demo_dataset.py                    # 固定研究数据集端到端演示
 ```
