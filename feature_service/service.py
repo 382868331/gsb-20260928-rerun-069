@@ -12,6 +12,7 @@ from .engine import (
     IncrementalProjection,
     compute_from_rows,
     explain_from_rows,
+    feature_keys,
     read_log_rows,
 )
 from .store import connect, dumps, loads
@@ -215,12 +216,22 @@ class FeatureService:
         """整批路径：跳过一切缓存，直接扫描原始事件账本重放。"""
         return compute_from_rows(spec, as_of, read_log_rows(self.conn, entity))
 
-    def explain_incremental(self, entity: str, spec: FeatureSpec, as_of: int) -> dict[str, object]:
+    def explain_incremental(
+        self, entity: str, spec: FeatureSpec, as_of: int, *, include_blocked: bool = False
+    ) -> dict[str, object]:
         self.projection.catch_up()
-        return explain_from_rows(spec, as_of, self.projection.read_rows(entity))
+        return explain_from_rows(
+            spec, as_of, self.projection.read_rows(entity),
+            include_blocked=include_blocked,
+        )
 
-    def explain_batch(self, entity: str, spec: FeatureSpec, as_of: int) -> dict[str, object]:
-        return explain_from_rows(spec, as_of, read_log_rows(self.conn, entity))
+    def explain_batch(
+        self, entity: str, spec: FeatureSpec, as_of: int, *, include_blocked: bool = False
+    ) -> dict[str, object]:
+        return explain_from_rows(
+            spec, as_of, read_log_rows(self.conn, entity),
+            include_blocked=include_blocked,
+        )
 
     def rebuild_projection(self) -> None:
         """丢弃增量缓存并整批重放（运维/校验用）。"""
@@ -228,10 +239,18 @@ class FeatureService:
 
     # ---- 物化：开放结果随可见修订更新，封存结果保持原样 -----------------
 
-    def _explain(self, sample, spec: FeatureSpec, batch: bool) -> dict[str, object]:
+    def _explain(
+        self, sample, spec: FeatureSpec, batch: bool, *, include_blocked: bool = False
+    ) -> dict[str, object]:
         if batch:
-            return self.explain_batch(sample["entity_id"], spec, sample["as_of"])
-        return self.explain_incremental(sample["entity_id"], spec, sample["as_of"])
+            return self.explain_batch(
+                sample["entity_id"], spec, sample["as_of"],
+                include_blocked=include_blocked,
+            )
+        return self.explain_incremental(
+            sample["entity_id"], spec, sample["as_of"],
+            include_blocked=include_blocked,
+        )
 
     def _stored_rows(
         self, sample_id: str, feature_name: str, version: int
@@ -893,6 +912,446 @@ class FeatureService:
                 f"样本 {sample_id!r} 尚未物化 {feature_name!r} v{version}"
             )
         return {r["feature_key"]: loads(r["value"]) for r in rows}
+
+    # ---- 固定研究数据集：跨样本/跨特征的不可变快照 ----------------------
+
+    def _dataset_targets(self, selection: list[dict[str, object]] | None):
+        if selection is None:
+            samples = self.conn.execute(
+                "SELECT sample_id FROM samples ORDER BY sample_id"
+            ).fetchall()
+            targets = [
+                {"sample_id": r["sample_id"], "feature_name": name,
+                 "feature_version": version}
+                for r in samples
+                for name, version in self.list_features()
+            ]
+        else:
+            targets = [dict(t) for t in selection]
+        grouped: dict[tuple[str, str, int], dict[str, object]] = {}
+        for target in targets:
+            sample_id = str(target["sample_id"])
+            sample = self._sample(sample_id)
+            feature_name = target.get("feature_name")
+            if feature_name is None:
+                names = [
+                    (name, version) for name, version in self.list_features()
+                ]
+            else:
+                version = target.get("feature_version", target.get("version"))
+                names = [(str(feature_name), self._get_spec(str(feature_name), version).version)]
+            for feature_name, version in names:
+                spec = self._get_spec(feature_name, version)
+                if sample["entity_type"] != spec.entity and feature_name is not None:
+                    raise ValueError(
+                        f"样本 {sample_id!r} 实体类型 {sample['entity_type']!r} "
+                        f"与特征 {feature_name!r} 的 {spec.entity!r} 不匹配"
+                    )
+                if sample["entity_type"] != spec.entity:
+                    continue
+                key = (sample_id, feature_name, spec.version)
+                wanted = target.get("feature_keys")
+                entry = grouped.setdefault(key, {
+                    "sample_id": sample_id,
+                    "feature_name": feature_name,
+                    "feature_version": spec.version,
+                    "keys": set(feature_keys(spec)),
+                    "revision_id": target.get("revision_id"),
+                    "adopt_current": bool(target.get("adopt_current", False)),
+                })
+                if wanted is not None:
+                    entry["keys"] &= {str(k) for k in wanted}
+                if entry.get("revision_id") is None:
+                    entry["revision_id"] = target.get("revision_id")
+                entry["adopt_current"] = entry["adopt_current"] or bool(
+                    target.get("adopt_current", False)
+                )
+        return [grouped[k] for k in sorted(grouped)]
+
+    def _source_events_for_seqs(self, seqs: set[int] | list[int]) -> list[dict[str, object]]:
+        records = self._evidence_records(sorted(set(seqs)))
+        events = {
+            (r["entity"], r["source"], r["event_id"]): {
+                "entity": r["entity"], "source": r["source"],
+                "event_id": r["event_id"],
+            }
+            for r in records.values()
+        }
+        return [events[k] for k in sorted(events)]
+
+    def _dataset_items(
+        self,
+        selection: list[dict[str, object]] | None,
+        *,
+        batch: bool,
+        adopt_published: bool = False,
+    ) -> list[dict[str, object]]:
+        items: list[dict[str, object]] = []
+        for target in self._dataset_targets(selection):
+            sample_id = target["sample_id"]
+            feature_name = target["feature_name"]
+            version = int(target["feature_version"])
+            sample = self._sample(sample_id)
+            spec = self._get_spec(feature_name, version)
+            explained = self._explain(sample, spec, batch, include_blocked=True)
+            stored = self._stored_rows(sample_id, feature_name, version)
+            stored_evidence = self._stored_evidence(sample_id, feature_name, version)
+            revision_entries: dict[str, dict[str, object]] = {}
+            revision_id = target.get("revision_id")
+            if revision_id is None and adopt_published:
+                revision_row = self.conn.execute(
+                    "SELECT revision_id FROM revisions "
+                    "WHERE sample_id = ? AND feature_name = ? AND version = ? "
+                    "AND status = 'published' ORDER BY revision_id DESC LIMIT 1",
+                    (sample_id, feature_name, version),
+                ).fetchone()
+                if revision_row is not None:
+                    revision_id = revision_row["revision_id"]
+            if revision_id is not None:
+                revision = self.get_revision(int(revision_id))
+                if revision["sample_id"] != sample_id or revision["feature_name"] != feature_name \
+                        or revision["version"] != version or revision["status"] != "published":
+                    raise ValueError(f"修订 {revision_id} 不能用于该特征视角")
+                revision_entries = {e["feature_key"]: e for e in revision["entries"]}
+            for key in sorted(target["keys"]):
+                blocked = explained.get("blocked_evidence", {}).get(key, [])
+                if revision_id is not None:
+                    if key not in revision_entries:
+                        continue
+                    entry = revision_entries[key]
+                    value = entry["new_value"]
+                    evidence = entry["evidence"]
+                    perspective = "published_revision"
+                    adopted_revision_id = int(revision_id)
+                    seal_id = None
+                    confirmation_state = "adopted_revision"
+                else:
+                    current_row = stored.get(key)
+                    if current_row is not None and current_row["status"] == SEALED \
+                            and not target["adopt_current"]:
+                        value = current_row["value"]
+                        evidence = stored_evidence.get(key, {"behavior": [], "state": []})
+                        perspective = "stored"
+                        adopted_revision_id = None
+                        seal_id = current_row["seal_id"]
+                        confirmation_state = "sealed"
+                    else:
+                        value = explained["values"].get(key)
+                        evidence = explained["evidence"].get(
+                            key, {"behavior": [], "state": []}
+                        )
+                        perspective = "stored"
+                        adopted_revision_id = None
+                        seal_id = None if current_row is None else current_row["seal_id"]
+                        confirmation_state = "unconfirmed"
+                all_seqs = {s for seqs in evidence.values() for s in seqs}
+                has_evidence = bool(all_seqs)
+                if blocked and confirmation_state == "unconfirmed":
+                    evidence_state = "time_restricted"
+                elif has_evidence or confirmation_state in ("sealed", "adopted_revision"):
+                    evidence_state = "available"
+                else:
+                    evidence_state = "no_evidence"
+                items.append({
+                    "sample_id": sample_id,
+                    "feature_name": feature_name,
+                    "feature_version": version,
+                    "feature_key": key,
+                    "value": value,
+                    "as_of": sample["as_of"],
+                    "perspective": perspective,
+                    "adopted_revision_id": adopted_revision_id,
+                    "seal_id": seal_id,
+                    "confirmation_state": confirmation_state,
+                    "evidence_state": evidence_state,
+                    "eligible": confirmation_state != "unconfirmed",
+                    "reasons": [] if confirmation_state != "unconfirmed" else (
+                        ["time_restricted"] if evidence_state == "time_restricted" else
+                        ["no_evidence"] if evidence_state == "no_evidence" else
+                        ["unconfirmed"]
+                    ),
+                    "evidence": evidence,
+                    "source_events": self._source_events_for_seqs(all_seqs),
+                    "blocked_records": [dict(r) for r in self._evidence_records(blocked).values()],
+                })
+        return items
+
+    def preview_research_dataset(
+        self,
+        selection: list[dict[str, object]] | None = None,
+        *,
+        batch: bool = False,
+        adopt_revisions: bool = False,
+    ) -> dict[str, object]:
+        """预览固定研究数据集：说明每个值来源、确认状态和不可纳入原因。"""
+        items = self._dataset_items(
+            selection, batch=batch, adopt_published=adopt_revisions
+        )
+        sample_ids = sorted({item["sample_id"] for item in items})
+        samples = []
+        for sample_id in sample_ids:
+            own = [item for item in items if item["sample_id"] == sample_id]
+            reasons = sorted({reason for item in own for reason in item["reasons"]})
+            samples.append({
+                "sample_id": sample_id,
+                "complete": all(item["eligible"] for item in own) and bool(own),
+                "included_items": sum(1 for item in own if item["eligible"]),
+                "pending_items": sum(1 for item in own if not item["eligible"]),
+                "reasons": reasons,
+            })
+        complete_ids = {s["sample_id"] for s in samples if s["complete"]}
+        return {
+            "items": items,
+            "samples": samples,
+            "complete_samples": [s["sample_id"] for s in samples if s["complete"]],
+            "incomplete_samples": [s["sample_id"] for s in samples if not s["complete"]],
+            "sample_coverage": len(complete_ids),
+            "source_event_count": len({
+                (e["entity"], e["source"], e["event_id"])
+                for item in items if item["eligible"] and item["sample_id"] in complete_ids
+                for e in item["source_events"]
+            }),
+        }
+
+    def freeze_research_dataset(
+        self,
+        dataset_id: str,
+        selection: list[dict[str, object]] | None = None,
+        *,
+        include_unconfirmed: bool = False,
+        batch: bool = False,
+        adopt_revisions: bool = False,
+        frozen_at: int | None = None,
+        note: str | None = None,
+    ) -> dict[str, object]:
+        """冻结本次采用的样本与特征视角；未确认范围默认不纳入。"""
+        preview = self.preview_research_dataset(
+            selection, batch=batch, adopt_revisions=adopt_revisions
+        )
+        items = [
+            item for item in preview["items"]
+            if item["eligible"] or include_unconfirmed
+        ]
+        if preview["incomplete_samples"] and not include_unconfirmed:
+            raise ValueError(
+                "存在不完整样本: " + ", ".join(preview["incomplete_samples"])
+            )
+        if not items:
+            raise ValueError("没有可冻结的数据集项目")
+        version_row = self.conn.execute(
+            "SELECT COALESCE(MAX(version), 0) + 1 AS v FROM research_datasets WHERE dataset_id = ?",
+            (dataset_id,),
+        ).fetchone()
+        version = int(version_row["v"])
+        frozen_at = int(time.time() * 1000) if frozen_at is None else frozen_at
+        last_seq = self.conn.execute("SELECT COALESCE(MAX(seq), -1) AS s FROM event_log").fetchone()["s"]
+        self.conn.execute(
+            "INSERT INTO research_datasets "
+            "(dataset_id, version, status, created_at, frozen_at, last_seq, selection, "
+            "pending_differences, note) VALUES (?,?, 'frozen', ?, ?, ?, ?, ?, ?)",
+            (dataset_id, version, frozen_at, frozen_at, last_seq, dumps(selection),
+             dumps([]), note),
+        )
+        self.conn.executemany(
+            "INSERT INTO research_dataset_items "
+            "(dataset_id, dataset_version, sample_id, feature_name, feature_version, "
+            "feature_key, value, as_of, perspective, adopted_revision_id, seal_id, "
+            "confirmation_state, evidence_state, evidence, source_events, blocked_records) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            [
+                (dataset_id, version, item["sample_id"], item["feature_name"],
+                 item["feature_version"], item["feature_key"], dumps(item["value"]),
+                 item["as_of"], item["perspective"], item["adopted_revision_id"],
+                 item["seal_id"], item["confirmation_state"], item["evidence_state"],
+                 dumps(item["evidence"]), dumps(item["source_events"]),
+                 dumps(item["blocked_records"]))
+                for item in items
+            ],
+        )
+        self.conn.commit()
+        return self.get_research_dataset(dataset_id, version)
+
+    def get_research_dataset(self, dataset_id: str, version: int | None = None) -> dict[str, object]:
+        """逐项读取不可变研究数据集及其样本/来源事件覆盖统计。"""
+        if version is None:
+            row = self.conn.execute(
+                "SELECT MAX(version) AS v FROM research_datasets WHERE dataset_id = ?",
+                (dataset_id,),
+            ).fetchone()
+            if row["v"] is None:
+                raise KeyError(f"研究数据集不存在: {dataset_id!r}")
+            version = int(row["v"])
+        meta = self.conn.execute(
+            "SELECT dataset_id, version, status, created_at, frozen_at, last_seq, selection, "
+            "pending_differences, note FROM research_datasets "
+            "WHERE dataset_id = ? AND version = ?",
+            (dataset_id, version),
+        ).fetchone()
+        if meta is None:
+            raise KeyError(f"研究数据集不存在: {dataset_id!r} v{version}")
+        items = []
+        for r in self.conn.execute(
+            "SELECT sample_id, feature_name, feature_version, feature_key, value, as_of, "
+            "perspective, adopted_revision_id, seal_id, confirmation_state, evidence_state, "
+            "evidence, source_events, blocked_records FROM research_dataset_items "
+            "WHERE dataset_id = ? AND dataset_version = ? "
+            "ORDER BY sample_id, feature_name, feature_version, feature_key",
+            (dataset_id, version),
+        ).fetchall():
+            items.append({
+                "sample_id": r["sample_id"],
+                "feature_name": r["feature_name"],
+                "feature_version": r["feature_version"],
+                "feature_key": r["feature_key"],
+                "value": loads(r["value"]),
+                "as_of": r["as_of"],
+                "perspective": r["perspective"],
+                "adopted_revision_id": r["adopted_revision_id"],
+                "seal_id": r["seal_id"],
+                "confirmation_state": r["confirmation_state"],
+                "evidence_state": r["evidence_state"],
+                "evidence": loads(r["evidence"]),
+                "source_events": loads(r["source_events"]),
+                "blocked_records": loads(r["blocked_records"]),
+            })
+        source_events = {
+            (e["entity"], e["source"], e["event_id"])
+            for item in items for e in item["source_events"]
+        }
+        return {
+            **{k: meta[k] for k in meta.keys()},
+            "selection": loads(meta["selection"]),
+            "pending_differences": loads(meta["pending_differences"]),
+            "items": items,
+            "sample_coverage": len({item["sample_id"] for item in items}),
+            "source_event_count": len(source_events),
+        }
+
+    def update_research_dataset(
+        self,
+        dataset_id: str,
+        selection: list[dict[str, object]] | None = None,
+        *,
+        adopt_revisions: bool = False,
+        adopt_visible: bool = False,
+        include_unconfirmed: bool = False,
+        batch: bool = False,
+        frozen_at: int | None = None,
+        note: str | None = None,
+    ) -> dict[str, object]:
+        """发布同一研究数据集的新版本，并保留未采用差异。"""
+        old = self.get_research_dataset(dataset_id)
+        old_version = int(old["version"])
+        if selection is None:
+            selection = old["selection"]
+            if selection is None:
+                selection = None
+        current_preview = self.preview_research_dataset(
+            selection, batch=batch, adopt_revisions=adopt_revisions
+        )
+        revision_preview = self.preview_research_dataset(
+            selection, batch=batch, adopt_revisions=True
+        )
+        old_by_key = {
+            (i["sample_id"], i["feature_name"], i["feature_version"], i["feature_key"]): i
+            for i in old["items"]
+        }
+        new_by_key = {
+            (i["sample_id"], i["feature_name"], i["feature_version"], i["feature_key"]): i
+            for i in current_preview["items"]
+        }
+        revised_by_key = {
+            (i["sample_id"], i["feature_name"], i["feature_version"], i["feature_key"]): i
+            for i in revision_preview["items"]
+        }
+        effective: list[dict[str, object]] = []
+        differences: list[dict[str, object]] = []
+        for key in sorted(set(old_by_key) | set(new_by_key)):
+            old_item = old_by_key.get(key)
+            current_item = new_by_key.get(key)
+            if old_item is None or current_item is None:
+                category = "sample_scope"
+            else:
+                revised_item = revised_by_key.get(key)
+                if revised_item is not None and revised_item.get("adopted_revision_id") is not None:
+                    category = "feature_revision"
+                elif old_item["perspective"] != current_item["perspective"]:
+                    category = "feature_revision"
+                elif current_item["confirmation_state"] == "unconfirmed":
+                    category = "visible_material_selection"
+                else:
+                    category = "visible_material_selection"
+            if old_item is None:
+                chosen = current_item
+            elif current_item is None:
+                chosen = None
+            else:
+                revised_item = revised_by_key.get(key)
+                comparison_item = revised_item if category == "feature_revision" else current_item
+                use_current = (
+                    adopt_visible and current_item["confirmation_state"] == "unconfirmed"
+                ) or (
+                    adopt_revisions and comparison_item["perspective"] == "published_revision"
+                )
+                chosen = dict(comparison_item if use_current else old_item)
+                if not use_current:
+                    if comparison_item["confirmation_state"] == "unconfirmed" or (
+                        comparison_item["perspective"] == "published_revision"
+                    ):
+                        chosen["confirmation_state"] = old_item["confirmation_state"]
+                        chosen["evidence_state"] = old_item["evidence_state"]
+                        chosen["perspective"] = old_item["perspective"]
+                        chosen["adopted_revision_id"] = old_item["adopted_revision_id"]
+                        chosen["seal_id"] = old_item["seal_id"]
+                if old_item["value"] != comparison_item["value"] or \
+                        old_item["evidence"] != comparison_item["evidence"] or \
+                        old_item["confirmation_state"] != comparison_item["confirmation_state"]:
+                    adopted = use_current
+                    differences.append({
+                        "sample_id": key[0],
+                        "feature_name": key[1],
+                        "feature_version": key[2],
+                        "feature_key": key[3],
+                        "category": category,
+                        "old_value": old_item["value"],
+                        "new_value": comparison_item["value"],
+                        "adopted": adopted,
+                    })
+            if chosen is not None and (chosen["confirmation_state"] != "unconfirmed" or include_unconfirmed):
+                chosen = dict(chosen)
+                chosen["eligible"] = chosen["confirmation_state"] != "unconfirmed"
+                effective.append(chosen)
+
+        frozen_at = int(time.time() * 1000) if frozen_at is None else frozen_at
+        last_seq = self.conn.execute("SELECT COALESCE(MAX(seq), -1) AS s FROM event_log").fetchone()["s"]
+        new_version = old_version + 1
+        self.conn.execute(
+            "INSERT INTO research_datasets "
+            "(dataset_id, version, status, created_at, frozen_at, last_seq, selection, "
+            "pending_differences, note) VALUES (?,?, 'frozen', ?, ?, ?, ?, ?, ?)",
+            (dataset_id, new_version, frozen_at, frozen_at, last_seq, dumps(selection),
+             dumps([d for d in differences if not d["adopted"]]), note),
+        )
+        self.conn.executemany(
+            "INSERT INTO research_dataset_items "
+            "(dataset_id, dataset_version, sample_id, feature_name, feature_version, "
+            "feature_key, value, as_of, perspective, adopted_revision_id, seal_id, "
+            "confirmation_state, evidence_state, evidence, source_events, blocked_records) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            [
+                (dataset_id, new_version, item["sample_id"], item["feature_name"],
+                 item["feature_version"], item["feature_key"], dumps(item["value"]),
+                 item["as_of"], item["perspective"], item["adopted_revision_id"],
+                 item["seal_id"], item["confirmation_state"], item["evidence_state"],
+                 dumps(item["evidence"]), dumps(item["source_events"]),
+                 dumps(item["blocked_records"]))
+                for item in effective
+            ],
+        )
+        self.conn.commit()
+        result = self.get_research_dataset(dataset_id, new_version)
+        result["changes"] = differences
+        return result
 
     def close(self) -> None:
         self.conn.close()

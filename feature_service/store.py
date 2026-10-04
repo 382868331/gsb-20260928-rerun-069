@@ -128,6 +128,44 @@ CREATE TABLE IF NOT EXISTS revision_entries (
     downstream  TEXT NOT NULL,   -- JSON list[{sample_id, feature_name, version, feature_key}]
     PRIMARY KEY (revision_id, feature_key)
 );
+
+-- 固定研究数据集：dataset_id 可随更新产生多个不可变版本。逐项保存冻结时
+-- 实际采用的值、视角、证据和来源事件身份；后续账本补登不改写旧版本。
+CREATE TABLE IF NOT EXISTS research_datasets (
+dataset_id          TEXT NOT NULL,
+version             INTEGER NOT NULL,
+status              TEXT NOT NULL CHECK (status IN ('frozen')),
+created_at          INTEGER NOT NULL,
+frozen_at           INTEGER NOT NULL,
+last_seq            INTEGER NOT NULL,
+selection           TEXT NOT NULL,
+pending_differences TEXT NOT NULL,
+note                TEXT,
+PRIMARY KEY (dataset_id, version)
+);
+
+CREATE TABLE IF NOT EXISTS research_dataset_items (
+dataset_id           TEXT NOT NULL,
+dataset_version      INTEGER NOT NULL,
+sample_id            TEXT NOT NULL,
+feature_name         TEXT NOT NULL,
+feature_version      INTEGER NOT NULL,
+feature_key          TEXT NOT NULL,
+value                TEXT,
+as_of                INTEGER NOT NULL,
+perspective          TEXT NOT NULL
+                     CHECK (perspective IN ('stored', 'published_revision')),
+adopted_revision_id  INTEGER,
+seal_id              INTEGER,
+confirmation_state   TEXT NOT NULL
+                     CHECK (confirmation_state IN ('sealed', 'adopted_revision', 'unconfirmed')),
+evidence_state       TEXT NOT NULL
+                     CHECK (evidence_state IN ('available', 'no_evidence', 'time_restricted')),
+evidence             TEXT NOT NULL,
+source_events        TEXT NOT NULL,
+blocked_records      TEXT NOT NULL,
+PRIMARY KEY (dataset_id, dataset_version, sample_id, feature_name, feature_version, feature_key)
+);
 """
 
 

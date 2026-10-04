@@ -84,7 +84,24 @@ def _reduce_visible(rows: list[sqlite3.Row], value_field: str | None) -> list[sq
     return out
 
 
-def explain_from_rows(spec: FeatureSpec, as_of: int, rows: list[sqlite3.Row]) -> dict[str, object]:
+def _reduce_at(rows: list[sqlite3.Row], as_of: int) -> dict[tuple[str, str], sqlite3.Row]:
+    latest: dict[tuple[str, str], sqlite3.Row] = {}
+    for row in rows:
+        if row["arrival_time"] <= as_of:
+            latest[(_column(row, "source", "default"), row["event_id"])] = row
+    return {
+        key: row for key, row in latest.items()
+        if row["op"] != "RETRACT"
+    }
+
+
+def explain_from_rows(
+    spec: FeatureSpec,
+    as_of: int,
+    rows: list[sqlite3.Row],
+    *,
+    include_blocked: bool = False,
+) -> dict[str, object]:
     """纯函数：账本行 → 特征值及每个值使用的账本 seq。
 
     批路径与增量路径都调用本函数，保证两条路径同一套语义。
@@ -94,9 +111,18 @@ def explain_from_rows(spec: FeatureSpec, as_of: int, rows: list[sqlite3.Row]) ->
         r for r in visible_rows
         if _column(r, "source", "default") in spec.sources
     ]
-    active_rows = _reduce_visible(behavior_rows, spec.value_field)
+    active_rows_map = _reduce_at(behavior_rows, as_of)
+    active_rows = list(active_rows_map.values())
     result: dict[str, object] = {}
     evidence: dict[str, dict[str, list[int]]] = {}
+    blocked: dict[str, list[int]] = {}
+    all_behavior_rows = [
+        r for r in rows if _column(r, "source", "default") in spec.sources
+    ]
+    eventual_behavior = _reduce_at(
+        all_behavior_rows,
+        max(as_of, max((r["arrival_time"] for r in all_behavior_rows), default=as_of)),
+    )
     for window in spec.windows:
         lo, hi = as_of - window, as_of
         window_rows = [r for r in active_rows if lo <= r["event_time"] < hi]
@@ -106,13 +132,36 @@ def explain_from_rows(spec: FeatureSpec, as_of: int, rows: list[sqlite3.Row]) ->
             key = f"{spec.name}_w{window}_{agg_name}"
             result[key] = agg.compute(values) if values else agg.empty
             evidence[key] = {"behavior": [r["seq"] for r in window_rows], "state": []}
+            changed_identities = {
+                identity
+                for identity in set(active_rows_map) | set(eventual_behavior)
+                if active_rows_map.get(identity) != eventual_behavior.get(identity)
+            }
+            blocked_seqs = {
+                r["seq"]
+                for r in all_behavior_rows
+                if r["arrival_time"] > as_of
+                and (_column(r, "source", "default"), r["event_id"]) in changed_identities
+                and (
+                    lo <= r["event_time"] < hi
+                    or (
+                        r["op"] == "RETRACT"
+                        and (current := active_rows_map.get(
+                            (_column(r, "source", "default"), r["event_id"])
+                        )) is not None
+                        and lo <= current["event_time"] < hi
+                    )
+                )
+            }
+            blocked[key] = sorted(blocked_seqs)
 
     if spec.state_source is not None:
         state_rows = [
             r for r in visible_rows
             if _column(r, "source", "default") == spec.state_source
         ]
-        active_states = _reduce_visible(state_rows, spec.state_field)
+        active_states_map = _reduce_at(state_rows, as_of)
+        active_states = list(active_states_map.values())
         current_states = [r for r in active_states if r["event_time"] <= as_of]
         state_row = max(
             current_states,
@@ -122,8 +171,41 @@ def explain_from_rows(spec: FeatureSpec, as_of: int, rows: list[sqlite3.Row]) ->
         key = f"{spec.name}_last_state"
         result[key] = None if state_row is None else _payload_value(state_row, spec.state_field)
         evidence[key] = {"behavior": [], "state": [] if state_row is None else [state_row["seq"]]}
+        all_state_rows = [
+            r for r in rows if _column(r, "source", "default") == spec.state_source
+        ]
+        eventual_states_map = _reduce_at(
+            all_state_rows,
+            max(as_of, max((r["arrival_time"] for r in all_state_rows), default=as_of)),
+        )
+        eventual_states = [r for r in eventual_states_map.values() if r["event_time"] <= as_of]
+        eventual_state = max(
+            eventual_states,
+            key=lambda r: (r["event_time"], r["arrival_time"], r["seq"]),
+            default=None,
+        )
+        blocked_state: list[int] = []
+        current_state_seq = None if state_row is None else state_row["seq"]
+        eventual_state_seq = None if eventual_state is None else eventual_state["seq"]
+        if current_state_seq != eventual_state_seq:
+            relevant_state_identities = {
+                (None if row is None else _column(row, "source", "default"),
+                 None if row is None else row["event_id"])
+                for row in (state_row, eventual_state)
+            }
+            blocked_state = [
+                r["seq"] for r in all_state_rows
+                if r["arrival_time"] > as_of and r["event_time"] <= as_of
+                and (_column(r, "source", "default"), r["event_id"])
+                in relevant_state_identities
+            ]
+        blocked[key] = blocked_state
 
-    return {"values": result, "evidence": evidence}
+    return {
+        "values": result,
+        "evidence": evidence,
+        "blocked_evidence": blocked if include_blocked else {},
+    }
 
 
 def compute_from_rows(spec: FeatureSpec, as_of: int, rows: list[sqlite3.Row]) -> dict[str, object]:

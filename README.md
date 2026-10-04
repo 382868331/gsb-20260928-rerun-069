@@ -28,6 +28,7 @@
 - **封存流程**：先 `preview_seal` 预览受影响样本、窗口和原因（late_arrival / retract / revision / window_boundary / new_data），再用 `seal` 确认封存哪些范围；封存值取封存时点当时可见的计算结果。一次封存可以只确认部分样本和范围，剩余部分继续开放；每次 `seal` 调用是一批确认（`seal_batches`），后续批次允许与先前范围交叠——交叠的 key 保持首次确认的值与归属批次，在新批中记为 already_sealed，不重复计入也不遗漏。
 - **归属查询**：`query_features` 逐 feature_key 说明当前值归属哪次封存确认（seal_id）、哪些部分仍可更新（updatable），以及每个值使用的账本 seq；同一条来源变动跨越多个范围时，每个范围只计入一次。
 - **修订流程**：对已封存结果用 `propose_revision` 提出修订——列出新旧值、新值采用的原始资料与受影响下游（共享同一来源记录的其它已保存结果）；`publish_revision` 发布后成为独立可查的修订视角，`reject_revision` 驳回。未采纳的修订不改变当前已确认视角，也不会提前影响依赖这些特征的研究；已封存的原始值任何情况下都不被改写。
+- **研究数据集**：`preview_research_dataset` 跨样本/跨特征预览固定数据集，逐项给出采用值、封存或修订视角、证据 seq、来源事件身份、`unconfirmed` / `time_restricted` / `no_evidence` 状态；`freeze_research_dataset` 冻结成同一 `dataset_id` 下的不可变版本。默认只冻结完整样本，后续补登的早期资料不会改写旧版本；`update_research_dataset` 创建新版本，并把差异区分为 `sample_scope`、`feature_revision` 或 `visible_material_selection`，未采用差异保留在 `pending_differences`。样本覆盖按样本身份去重，来源证据按 `(entity, source, event_id)` 去重，同一来源事件参与多个特征不会被误删或重复计数。
 - **重启接续**：封存决定（status / sealed_at）、历史值与证据全部持久化，重启后保留；开放范围仍随可见资料修订。
 - **增量 = 整批**：增量投影按 checkpoint(last_seq) 只追加新账本记录（重启后续跑），与直接扫描账本整批重放走同一个纯函数 compute_from_rows。
 
@@ -61,6 +62,24 @@ rev = svc.propose_revision("s1", "pay", 1)   # 对已封存结果提出修订：
 svc.publish_revision(rev["revision_id"])     # 发布为独立修订视角（原封存值不变）
 svc.get_revision(rev["revision_id"])         # 查询已采纳修订的血缘与当时可见资料
 svc.get_evidence("s1", "pay", 1)         # 重启后仍可查看每个值来自哪些原始记录
+```
+
+固定研究数据集：
+
+```python
+selection = [
+    {'sample_id': 's1', 'feature_name': 'pay', 'feature_version': 1},
+    {'sample_id': 's2', 'feature_name': 'profile', 'feature_version': 2},
+]
+preview = svc.preview_research_dataset(selection)
+if not preview['incomplete_samples']:
+    ds = svc.freeze_research_dataset('baseline', selection, frozen_at=1000)
+
+# 后续数据集可显式采用新可见资料或已发布修订；baseline v1 原样保留。
+svc.update_research_dataset(
+    'baseline', selection,
+    adopt_visible=True, adopt_revisions=True, frozen_at=2000,
+)
 ```
 
 时间统一使用**整数毫秒时间戳**，由调用方显式给出，保证可重放、可测试。
