@@ -7,12 +7,14 @@ point-in-time correctness：查询 as_of 只能看到 arrival_time <= as_of 的�
 
 from .service import FeatureService
 from .dataset import ResearchDatasetService, ResearchDatasetError
+from .split import SplitService
 from .aggregations import Aggregation, register_aggregation, get_aggregation
 
 __all__ = [
     "FeatureService",
     "ResearchDatasetService",
     "ResearchDatasetError",
+    "SplitService",
     "Aggregation",
     "register_aggregation",
     "get_aggregation",

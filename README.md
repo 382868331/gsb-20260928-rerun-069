@@ -152,6 +152,40 @@ ds.pending_diffs(new_id)                     # 仍未采用的差异被保留
 
 校验：`python -m unittest discover -s tests -v`；演示：`python demo_dataset.py`。
 
+## 按来源泄漏约束划分训练/验证集
+
+`SplitService` 在已冻结数据集之上提出、比较并采用训练/验证划分方案：
+
+- **研究者指定**：时间界限 `time_bound`（只用 as_of 不晚于界限的历史可见
+  样本，超出者排除并说明，不用未来资料补齐）、组比例 `target_ratio`、
+  必须共同归组的来源关系 `relations`（如跨主体共享同一原事件的样本）。
+- **自动归组**：共享原事件（来源事件身份相同）或同一主体的样本放在
+  同一侧；在此约束下贪心逼近目标比例，并优先保留类别覆盖（每个类别
+  尽量两侧都有）。
+- **合法引用不删除**：多个特征引用同一事件按身份只计一次，既不被删除，
+  也不被当成独立证据跨侧分配。
+- **无法满足即报告**：约束冲突（关系引用界限外样本）、极小类别只有
+  一个来源组、历史可见样本不足等，都在方案的 `unsatisfiable` 中给出
+  无法满足的范围。
+- **方案不可变**：新增迟到资料只能形成新方案；`compare_schemes` 并排
+  比较比例偏差/类别覆盖/泄漏核对，`adopt_scheme` 显式采用其中一份。
+- **隔离核对**：`validate_scheme` 以跨主体共享事件、同一主体、交叠
+  封存（seal_id/证据 seq）、未来资料逐项核对来源隔离及实际类别覆盖。
+
+```python
+from feature_service import FeatureService, ResearchDatasetService, SplitService
+
+sp = SplitService(ResearchDatasetService(svc))
+scheme = sp.propose_split(did, time_bound=1500, target_ratio=0.7,
+                          labels={"s1": "A", "s2": "B"},
+                          relations=[["s1", "s3"]])   # 必须同侧的样本
+scheme["train"]; scheme["validation"]; scheme["unsatisfiable"]
+other = sp.propose_split(did, time_bound=1500, target_ratio=0.5)
+sp.compare_schemes([scheme["scheme_id"], other["scheme_id"]])
+sp.adopt_scheme(scheme["scheme_id"])                  # 显式采用一份
+sp.validate_scheme(scheme["scheme_id"])               # 来源隔离与实际覆盖核对
+```
+
 ## 校验
 
 ```bash
