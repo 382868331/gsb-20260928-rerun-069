@@ -72,6 +72,31 @@ CREATE TABLE IF NOT EXISTS research_dataset_pending_diffs (
     detail       TEXT NOT NULL,
     PRIMARY KEY (dataset_id, sample_id, feature_name, version, feature_key)
 );
+
+-- 防泄漏切分方案：方案是快照，迟到资料只能形成新方案；
+-- 每个数据集最多一份 adopted，采用新方案时旧方案转为 superseded。
+CREATE TABLE IF NOT EXISTS research_split_schemes (
+    scheme_id     INTEGER PRIMARY KEY AUTOINCREMENT,
+    dataset_id    INTEGER NOT NULL,
+    name          TEXT,
+    status        TEXT NOT NULL CHECK (status IN ('proposed', 'adopted', 'superseded')),
+    time_boundary INTEGER NOT NULL,
+    train_ratio   REAL NOT NULL,
+    labels        TEXT,          -- JSON {sample_id: 类别}
+    co_groups     TEXT,          -- JSON [[sample_id, sample_id], ...]
+    ledger_seq    INTEGER NOT NULL,  -- 提出方案时的账本水位，用于识别迟到资料
+    created_at    INTEGER NOT NULL,
+    note          TEXT
+);
+
+CREATE TABLE IF NOT EXISTS research_split_assignments (
+    scheme_id INTEGER NOT NULL,
+    sample_id TEXT NOT NULL,
+    side      TEXT NOT NULL CHECK (side IN ('train', 'validation', 'excluded')),
+    group_id  INTEGER,
+    reason    TEXT,
+    PRIMARY KEY (scheme_id, sample_id)
+);
 """
 
 

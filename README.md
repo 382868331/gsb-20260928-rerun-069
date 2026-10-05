@@ -152,6 +152,45 @@ ds.pending_diffs(new_id)                     # 仍未采用的差异被保留
 
 校验：`python -m unittest discover -s tests -v`；演示：`python demo_dataset.py`。
 
+## 按来源泄漏约束划分训练集与验证集
+
+`LeakageSplitService` 在已冻结数据集上提供“提出方案 → 比较 → 明确采用”的
+切分流程：
+
+- **研究者给定约束**：`propose_split` 指定时间界限、训练侧目标比例、类别
+  标签与必须共同归组的来源关系（`co_groups`）。
+- **同侧归组**：共享同一原事件（同 source + event_id，含跨主体共享事件）
+  或同一主体的样本被并查集归为一组，整组只落一侧，绝不跨侧拆分。
+- **合法引用不删除**：同一来源事件被同一样本的多个特征引用按身份只计一次，
+  既不删除也不当作独立证据跨侧分配。
+- **不用未来资料**：`as_of` 超出时间界限的样本记为
+  `excluded(beyond_time_boundary)`，不拿来补齐任何一侧。
+- **无法满足的范围**：约束冲突（归组关系指向不可用样本）、历史可见样本不足、
+  组不可再分导致目标比例不可精确达到、极小类别无法两侧覆盖，都在
+  `unmet` 中明确列出，而不是静默放松约束。
+- **方案是快照**：`compare_schemes` 并列比较各方案的实际比例、覆盖与泄漏
+  核对结果，`adopt_scheme` 明确采用一份（同数据集其余方案转为
+  superseded）；迟到资料到账后旧方案原样保留并标记 `stale`，只能以其为
+  基础提出新方案。
+- **隔离与覆盖核对**：`verify_split` 以跨主体共享事件、同主体、极小类别
+  与交叠封存后的证据身份逐样本核对——任何来源事件或主体跨侧出现即报告
+  泄漏，存在泄漏的方案不能被采用。
+
+```python
+from feature_service import LeakageSplitService
+
+sp = LeakageSplitService(ds)
+r1 = sp.propose_split(did, time_boundary=1000, train_ratio=0.7,
+                      labels={"s1": "neg", "s2": "pos"},
+                      co_groups=[["s1", "s2"]], name="split-a")
+r1["unmet"]                       # 约束冲突 / 样本不足 / 不可达比例 / 极小类别
+r2 = sp.propose_split(did, time_boundary=1000, train_ratio=0.5,
+                      labels={"s1": "neg", "s2": "pos"}, name="split-b")
+sp.compare_schemes(did)           # 并列比较各方案的实际覆盖与隔离核对
+sp.adopt_scheme(r1["scheme_id"])  # 明确采用一份；其余转为 superseded
+sp.verify_split(r1["scheme_id"])  # 跨侧共享事件/主体、类别覆盖、迟到提示
+```
+
 ## 校验
 
 ```bash
